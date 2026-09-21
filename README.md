@@ -9,26 +9,14 @@ freezes and dims the desktop, and puts the result on the clipboard *and* in
 `Pictures\Nitshot`. On an HDR display it captures in floating point and
 saves real HDR files.
 
-**Formerly BetterSnippingTool.** Renamed before the first release. On first start,
-Nitshot moves `%APPDATA%\BetterSnippingTool` to `%APPDATA%\Nitshot`, carries the
+On first start, Nitshot moves `%APPDATA%\BetterSnippingTool` to `%APPDATA%\Nitshot`, carries the
 settings over from the old INI section and re-registers autostart under the new name.
 Snips already saved in `Pictures\BetterSnippingTool` stay where they are; new ones go
 to `Pictures\Nitshot`.
 
 **User guide:** [English](docs/UserGuide.en.md) · [Deutsch](docs/Benutzerhandbuch.de.md). This README is the technical reference.
 
-## Status
-
-| Phase | Scope | State |
-|---|---|---|
-| 1 | Tray host, settings, hotkey hook | **done** |
-| 2 | Capture core — DXGI duplication, fullscreen snip, clipboard + PNG | **done** |
-| 3 | Overlay UI — dim, toolbar, rectangle / freeform / window | **done** |
-| 4 | HDR — fp16 capture, JPEG XR, tone mapping | **done** |
-| 5 | Polish — settings window, autostart, toast, docs | **done** |
-| 6 | MP4 recording with audio | **done** |
-| 7 | HDR recording — 10-bit BT.2020 PQ, HEVC, probed encoder choice | **done** |
-| 8 | Localisation — English and German, user-addable translations | **done** |
+# Usage
 
 Press the hotkey, the desktop freezes and dims, and the toolbar offers
 **rectangle · freeform · window · fullscreen · record · close**. On a display with
@@ -291,17 +279,16 @@ captured test tone coming back at 5838 against the 6000 it was played at.
 
   Hardware encoding was already in use before any of this:
   `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS` makes Media Foundation route to
-  whichever vendor MFT is installed — NVIDIA here, Intel's or AMD's elsewhere.
-  Coding against the NVENC, AMF and Quick Sync SDKs directly would mean three
+  whichever vendor MFT is installed — NVIDIA, Intel or AMD.
+  Direct coding against the NVENC, AMF and Quick Sync SDKs directly would mean three
   vendor SDKs to land exactly where `MFTEnumEx` already lands.
 
 - **"Best available" is not "newest".** On an HDR display HEVC wins outright,
   being the only way to carry HDR here at all. On an SDR one H.264 is preferred
-  even though it is older and larger: there is **no software HEVC encoder** on
-  this system, Windows 10 needs the HEVC Video Extensions package to *play* HEVC
-  back (this machine cannot — `MF_E_TOPO_CODEC_NOT_FOUND`), and plenty of upload
-  targets reject it. `RecordEncoder` overrides the ranking; a choice that stops
-  probing clean falls back down the list and says so in the log.
+  even though it is older and larger. Windows 10 needs the HEVC Video Extensions
+  package to *play* HEVC back, and plenty of upload targets reject it.
+  `RecordEncoder` overrides the ranking; a choice that stops probing clean falls
+  back down the list and says so in the log.
 
 - **The container is stamped afterwards.** Media Foundation's MP4 sink writes no
   `colr` box, so nothing outside the HEVC bitstream said what the picture was, and
