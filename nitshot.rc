@@ -1,0 +1,118 @@
+#include <windows.h>
+#include <winver.h>
+#include "resource.h"
+
+#ifndef RT_MANIFEST
+#define RT_MANIFEST 24
+#endif
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID_ 1
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID_ RT_MANIFEST "app.manifest"
+
+IDI_APPICON ICON "nitshot.ico"
+
+IDD_SETTINGS DIALOGEX 0, 0, 340, 206
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Nitshot settings"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    /* The strip first, so it is first in the tab order. The five pages below
+       share one area; only the current page's controls are visible, and a
+       hidden control takes no part in tabbing or keyboard letters. */
+    CONTROL         "", IDC_TABS, "BsnipTabs", WS_TABSTOP, 7, 6, 326, 18
+
+    /* ---- General ---- */
+    CONTROL         "Copy every snip to the &clipboard", IDC_COPYCLIP,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 34, 300, 10
+    CONTROL         "Save &files", IDC_SAVEDISK,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 49, 300, 10
+    LTEXT           "&Pictures:", IDC_LBL_FOLDER, 26, 67, 38, 8
+    EDITTEXT        IDC_FOLDER, 66, 65, 190, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "&Browse...", IDC_BROWSE, 262, 64, 64, 16
+    LTEXT           "V&ideos:", IDC_LBL_VIDFOLDER, 26, 86, 38, 8
+    EDITTEXT        IDC_VIDFOLDER, 66, 84, 190, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "Brow&se...", IDC_VIDBROWSE, 262, 83, 64, 16
+    LTEXT           "&Dim the desktop by", IDC_LBL_DIM, 14, 108, 76, 8
+    EDITTEXT        IDC_DIM, 92, 106, 30, 14, ES_NUMBER
+    LTEXT           "percent", IDC_LBL_PERCENT, 126, 108, 40, 8
+    CONTROL         "Show a notification when a snip is sa&ved", IDC_TOAST,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 126, 310, 10
+    LTEXT           "&Language:", IDC_LBL_LANGUAGE, 14, 145, 44, 8
+    COMBOBOX        IDC_LANGUAGE, 60, 143, 160, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "Start with &Windows", IDC_AUTOSTART,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 162, 300, 10
+
+    /* ---- HDR ---- */
+    LTEXT           "", IDC_HDRSTATUS, 14, 34, 312, 18
+    CONTROL         "Save HDR snips as .&jxr", IDC_JXR,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 58, 300, 10
+    CONTROL         "...and a tone-mapped .png beside it", IDC_SIDECAR,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 26, 73, 290, 10
+    CONTROL         "Keep &highlight details in the 8-bit copy", IDC_ROLLOFF,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 88, 210, 10
+    LTEXT           "&Quality", IDC_LBL_QUALITY, 230, 89, 32, 8
+    EDITTEXT        IDC_QUALITY, 264, 87, 30, 14, ES_NUMBER
+    CONTROL         "&Record in HDR when the display is in HDR", IDC_RECHDR,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 106, 310, 10
+    CONTROL         "Ignore HDR, capture 8-&bit", IDC_FORCESDR,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 121, 310, 10
+
+    /* ---- Recording ---- */
+    LTEXT           "&Sound:", IDC_LBL_SOUND, 14, 36, 44, 8
+    COMBOBOX        IDC_RECAUDIO, 60, 34, 110, 80, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "F&rames per second:", IDC_LBL_FPS, 184, 36, 80, 8
+    EDITTEXT        IDC_RECFPS, 266, 34, 30, 14, ES_NUMBER
+    LTEXT           "&Encoder:", IDC_LBL_VIDEO, 14, 55, 44, 8
+    COMBOBOX        IDC_RECENC, 60, 53, 266, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "Save the sound as a lossless .&wav beside the .mp4",
+                    IDC_RECWAV, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 74, 312, 10
+    CONTROL         "...and build the .mp4's sound from it, keeping only the .mp4",
+                    IDC_RECMUX, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 26, 89, 300, 10
+
+    /* ---- Hotkeys ---- */
+    CONTROL         "Take over &Win+Shift+S", IDC_HOOKWSS,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 34, 300, 10
+    CONTROL         "Take over &PrtScn", IDC_HOOKPRTSC,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 49, 300, 10
+    CONTROL         "PrtScn takes the whole screen without the &overlay",
+                    IDC_PRTSCFULL, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 64, 310, 10
+
+    /* ---- Advanced ---- */
+    CONTROL         "Always use &GDI capture", IDC_FORCEGDI,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 34, 300, 10
+    CONTROL         "Diagnostic &log", IDC_DEBUGLOG,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 14, 49, 300, 10
+
+    DEFPUSHBUTTON   "OK", IDOK, 158, 182, 52, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 216, 182, 52, 16
+    PUSHBUTTON      "&Apply", IDC_APPLY, 274, 182, 52, 16, WS_DISABLED
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     APP_VER_MAJOR,APP_VER_MINOR,APP_VER_PATCH,APP_VER_BUILD
+PRODUCTVERSION  APP_VER_MAJOR,APP_VER_MINOR,APP_VER_PATCH,APP_VER_BUILD
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "Rekow IT"
+            VALUE "FileDescription",  "Nitshot - fast native screen capture"
+            VALUE "FileVersion",      APP_VER_STRING
+            VALUE "InternalName",     "nitshot"
+            VALUE "LegalCopyright",   "Copyright © 2026 Rekow IT"
+            VALUE "OriginalFilename", "Nitshot.exe"
+            VALUE "ProductName",      "Nitshot"
+            VALUE "ProductVersion",   APP_VER_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
