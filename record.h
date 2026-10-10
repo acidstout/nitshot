@@ -40,6 +40,11 @@ BOOL  Record_Start(HWND notify, UINT doneMsg, const RecordOptions *opt);
 void  Record_Stop(void);
 
 BOOL  Record_IsActive(void);
+
+/* True from Record_Start until the worker has finished for good - including
+   the setup and finalisation stretches, where Record_IsActive() reads false
+   although the thread is very much alive. */
+BOOL  Record_IsBusy(void);
 DWORD Record_ElapsedMs(void);
 
 void  Record_FreeResult(RecordResult *res);

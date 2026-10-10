@@ -35,7 +35,54 @@ struct HdrVideo {
 
     UINT16              lastPeak;     /* luma codes, from the last frame */
     double              lastMean;
+
+    /*
+     * Light statistics on the GPU, for the zero-copy path where the luma
+     * plane never reaches the CPU. A compute shader reduces each 16x16 tile
+     * to its brightest code and its sum; the tile results are copied into a
+     * small ring of readback buffers and read a frame or two later, when the
+     * GPU is done with them, so measuring never stalls the recording.
+     */
+    ID3D11ComputeShader       *csStats;
+    ID3D11Buffer              *statsBuf;     /* one uint2 per tile        */
+    ID3D11UnorderedAccessView *statsUav;
+    ID3D11Buffer              *statsCb;      /* width, height, tiles across */
+    ID3D11Buffer              *statsStage[3];
+    BOOL                       statsPending[3];
+    int                        statsNext;
+    UINT32                     tilesX, tilesY;
+    UINT32                    *tileScratch;  /* one readback, for summing */
 };
+
+/* Separate from the pixel shaders: it binds its own t0. */
+static const char g_hlslStats[] =
+"Texture2D<float> Luma : register(t0);\n"
+"RWStructuredBuffer<uint2> Tiles : register(u0);\n"
+"cbuffer Dims : register(b0) { uint gW; uint gH; uint gTilesX; uint gPad; };\n"
+"groupshared uint sMax[256];\n"
+"groupshared uint sSum[256];\n"
+"[numthreads(16, 16, 1)]\n"
+"void CSStats(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID,\n"
+"             uint gi : SV_GroupIndex)\n"
+"{\n"
+"    uint2 p = gid.xy * 16 + tid.xy;\n"
+"    uint  v = 0;\n"
+"    if (p.x < gW && p.y < gH)\n"
+"        v = (uint)(Luma.Load(int3(p, 0)) * 65535.0 + 0.5);\n"
+"    sMax[gi] = v;\n"
+"    sSum[gi] = v;\n"
+"    GroupMemoryBarrierWithGroupSync();\n"
+"    [unroll] for (uint s = 128; s > 0; s >>= 1) {\n"
+"        if (gi < s) {\n"
+"            sMax[gi] = max(sMax[gi], sMax[gi + s]);\n"
+"            sSum[gi] += sSum[gi + s];\n"
+"        }\n"
+"        GroupMemoryBarrierWithGroupSync();\n"
+"    }\n"
+"    /* 256 codes of at most 65535 sum to under 2^24: no overflow. */\n"
+"    if (gi == 0)\n"
+"        Tiles[gid.y * gTilesX + gid.x] = uint2(sMax[0], sSum[0]);\n"
+"}\n";
 
 /*
  * Two passes over the same maths. Chroma is averaged after the transfer
@@ -153,12 +200,16 @@ static BOOL CompileShaders(HdrVideo *hv)
     BOOL        ok = FALSE;
     const UINT  flags = D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_ENABLE_STRICTNESS;
 
-    lib = LoadLibraryW(L"d3dcompiler_47.dll");
+    /* From System32 only: a plain LoadLibrary would look in the exe's own
+       folder first and load whatever d3dcompiler_47.dll was planted there. */
+    lib = LoadLibraryExW(L"d3dcompiler_47.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!lib)
         return FALSE;
     compile = (pD3DCompile)(void *)GetProcAddress(lib, "D3DCompile");
-    if (!compile)
+    if (!compile) {
+        FreeLibrary(lib);
         return FALSE;
+    }
 
     if (FAILED(compile(g_hlsl, sizeof(g_hlsl) - 1, NULL, NULL, NULL,
                        "VSMain", "vs_4_0", flags, 0, &vsb, &err)))   goto done;
@@ -193,6 +244,9 @@ done:
     if (psa) ID3D10Blob_Release(psa);
     if (psb) ID3D10Blob_Release(psb);
     if (psc) ID3D10Blob_Release(psc);
+    /* Only after the blobs: their code lives in the compiler DLL. Every
+       recording used to take another reference to it and never give it back. */
+    FreeLibrary(lib);
     return ok;
 }
 
@@ -273,6 +327,16 @@ void HdrVideo_Destroy(HdrVideo *hv)
 {
     if (!hv)
         return;
+    {
+        int i;
+        for (i = 0; i < 3; i++)
+            if (hv->statsStage[i]) ID3D11Buffer_Release(hv->statsStage[i]);
+    }
+    if (hv->tileScratch) HeapFree(GetProcessHeap(), 0, hv->tileScratch);
+    if (hv->statsCb)  ID3D11Buffer_Release(hv->statsCb);
+    if (hv->statsUav) ID3D11UnorderedAccessView_Release(hv->statsUav);
+    if (hv->statsBuf) ID3D11Buffer_Release(hv->statsBuf);
+    if (hv->csStats)  ID3D11ComputeShader_Release(hv->csStats);
     if (hv->cbSdr)  ID3D11Buffer_Release(hv->cbSdr);
     if (hv->stgSdr) ID3D11Texture2D_Release(hv->stgSdr);
     if (hv->rtvSdr) ID3D11RenderTargetView_Release(hv->rtvSdr);
@@ -491,4 +555,241 @@ BOOL HdrVideo_ConvertToP010(HdrVideo *hv, BYTE *dst)
     ID3D11DeviceContext_Unmap(hv->ctx, (ID3D11Resource *)hv->stgUV, 0);
 
     return TRUE;
+}
+
+/* ------------------------------------------------------------ zero-copy */
+
+/* Compiled and allocated on first use: the CPU path never needs any of it. */
+static BOOL EnsureStats(HdrVideo *hv)
+{
+    pD3DCompile  compile;
+    HMODULE      lib;
+    ID3DBlob    *code = NULL, *err = NULL;
+    D3D11_BUFFER_DESC bd;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud;
+    UINT32       tiles;
+    int          i;
+    BOOL         ok = FALSE;
+
+    if (hv->csStats)
+        return TRUE;
+
+    lib = LoadLibraryExW(L"d3dcompiler_47.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!lib)
+        return FALSE;
+    compile = (pD3DCompile)(void *)GetProcAddress(lib, "D3DCompile");
+    if (compile &&
+        SUCCEEDED(compile(g_hlslStats, sizeof(g_hlslStats) - 1, NULL, NULL, NULL,
+                          "CSStats", "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                          &code, &err)) &&
+        SUCCEEDED(ID3D11Device_CreateComputeShader(hv->dev,
+                      ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code),
+                      NULL, &hv->csStats)))
+        ok = TRUE;
+    else if (err)
+        Log_Printf(L"hdrvideo: stats shader failed: %S",
+                   (const char *)ID3D10Blob_GetBufferPointer(err));
+    if (code) ID3D10Blob_Release(code);
+    if (err)  ID3D10Blob_Release(err);
+    FreeLibrary(lib);
+    if (!ok)
+        return FALSE;
+
+    hv->tilesX = (hv->width  + 15) / 16;
+    hv->tilesY = (hv->height + 15) / 16;
+    tiles = hv->tilesX * hv->tilesY;
+
+    ZeroMemory(&bd, sizeof(bd));
+    bd.ByteWidth           = tiles * 8;
+    bd.Usage               = D3D11_USAGE_DEFAULT;
+    bd.BindFlags           = D3D11_BIND_UNORDERED_ACCESS;
+    bd.MiscFlags           = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = 8;
+    if (FAILED(ID3D11Device_CreateBuffer(hv->dev, &bd, NULL, &hv->statsBuf)))
+        return FALSE;
+
+    ZeroMemory(&ud, sizeof(ud));
+    ud.Format              = DXGI_FORMAT_UNKNOWN;
+    ud.ViewDimension       = D3D11_UAV_DIMENSION_BUFFER;
+    ud.Buffer.NumElements  = tiles;
+    if (FAILED(ID3D11Device_CreateUnorderedAccessView(hv->dev,
+            (ID3D11Resource *)hv->statsBuf, &ud, &hv->statsUav)))
+        return FALSE;
+
+    for (i = 0; i < 3; i++) {
+        ZeroMemory(&bd, sizeof(bd));
+        bd.ByteWidth      = tiles * 8;
+        bd.Usage          = D3D11_USAGE_STAGING;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateBuffer(hv->dev, &bd, NULL, &hv->statsStage[i])))
+            return FALSE;
+    }
+
+    ZeroMemory(&bd, sizeof(bd));
+    bd.ByteWidth      = 16;
+    bd.Usage          = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(ID3D11Device_CreateBuffer(hv->dev, &bd, NULL, &hv->statsCb)))
+        return FALSE;
+    {
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (SUCCEEDED(ID3D11DeviceContext_Map(hv->ctx, (ID3D11Resource *)hv->statsCb,
+                                              0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+            UINT32 *d = (UINT32 *)m.pData;
+            d[0] = hv->width; d[1] = hv->height; d[2] = hv->tilesX; d[3] = 0;
+            ID3D11DeviceContext_Unmap(hv->ctx, (ID3D11Resource *)hv->statsCb, 0);
+        }
+    }
+    hv->tileScratch = (UINT32 *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)tiles * 8);
+    return hv->tileScratch != NULL;
+}
+
+/*
+ * Reads one finished slot and folds it into the running maxima. 'wait' is for
+ * the end of the recording and for a ring that has come all the way round;
+ * otherwise a slot the GPU is still writing is simply left for later.
+ */
+static BOOL HarvestSlot(HdrVideo *hv, int slot, BOOL wait)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    HRESULT hr;
+    UINT32  tiles = hv->tilesX * hv->tilesY, i, peak = 0;
+    UINT64  sum = 0;
+
+    if (!hv->statsPending[slot])
+        return TRUE;
+    hr = ID3D11DeviceContext_Map(hv->ctx, (ID3D11Resource *)hv->statsStage[slot], 0,
+                                 D3D11_MAP_READ, wait ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING)
+        return FALSE;
+    hv->statsPending[slot] = FALSE;
+    if (FAILED(hr))
+        return TRUE;                  /* lost: a gap in the stats, not an error */
+    memcpy(hv->tileScratch, m.pData, (SIZE_T)tiles * 8);
+    ID3D11DeviceContext_Unmap(hv->ctx, (ID3D11Resource *)hv->statsStage[slot], 0);
+
+    for (i = 0; i < tiles; i++) {
+        if (hv->tileScratch[i * 2] > peak)
+            peak = hv->tileScratch[i * 2];
+        sum += hv->tileScratch[i * 2 + 1];
+    }
+    /* The caller keeps maxima, so reporting the brightest of the frames that
+       came in since it last asked loses nothing. */
+    if (peak > hv->lastPeak)
+        hv->lastPeak = (UINT16)peak;
+    {
+        double mean = (double)sum / ((double)hv->width * hv->height);
+        if (mean > hv->lastMean)
+            hv->lastMean = mean;
+    }
+    return TRUE;
+}
+
+BOOL HdrVideo_RenderP010Into(HdrVideo *hv, ID3D11Texture2D *p010)
+{
+    D3D11_RENDER_TARGET_VIEW_DESC   rd;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+    ID3D11RenderTargetView    *rtvY = NULL, *rtvUV = NULL;
+    ID3D11ShaderResourceView  *luma = NULL;
+    ID3D11ShaderResourceView  *none[1]  = { NULL };
+    ID3D11UnorderedAccessView *noUav[1] = { NULL };
+    BOOL ok = FALSE;
+    int  i;
+
+    if (!hv || !p010)
+        return FALSE;
+
+    /* The planes as plain textures: luma as R16, interleaved chroma as R16G16. */
+    ZeroMemory(&rd, sizeof(rd));
+    rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    rd.Format = DXGI_FORMAT_R16_UNORM;
+    if (FAILED(ID3D11Device_CreateRenderTargetView(hv->dev, (ID3D11Resource *)p010, &rd, &rtvY)))
+        goto done;
+    rd.Format = DXGI_FORMAT_R16G16_UNORM;
+    if (FAILED(ID3D11Device_CreateRenderTargetView(hv->dev, (ID3D11Resource *)p010, &rd, &rtvUV)))
+        goto done;
+
+    Pass(hv, rtvY,  hv->psY,  hv->width,     hv->height);
+    Pass(hv, rtvUV, hv->psUV, hv->width / 2, hv->height / 2);
+    ID3D11DeviceContext_PSSetShaderResources(hv->ctx, 0, 1, none);
+    ID3D11DeviceContext_OMSetRenderTargets(hv->ctx, 0, NULL, NULL);
+
+    /* Reset the per-call maxima; harvested frames raise them again. */
+    hv->lastPeak = 0;
+    hv->lastMean = 0.0;
+
+    if (EnsureStats(hv)) {
+        ZeroMemory(&sd, sizeof(sd));
+        sd.Format = DXGI_FORMAT_R16_UNORM;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+        if (SUCCEEDED(ID3D11Device_CreateShaderResourceView(hv->dev,
+                (ID3D11Resource *)p010, &sd, &luma))) {
+            int slot = hv->statsNext;
+
+            /* Harvest whatever has finished, oldest first, without waiting. */
+            for (i = 1; i <= 3; i++)
+                HarvestSlot(hv, (slot + i) % 3, FALSE);
+            /* The slot about to be reused must be read first, even if that
+               means waiting - its frame would otherwise go unmeasured. */
+            HarvestSlot(hv, slot, TRUE);
+
+            ID3D11DeviceContext_CSSetShader(hv->ctx, hv->csStats, NULL, 0);
+            ID3D11DeviceContext_CSSetShaderResources(hv->ctx, 0, 1, &luma);
+            ID3D11DeviceContext_CSSetUnorderedAccessViews(hv->ctx, 0, 1, &hv->statsUav, NULL);
+            ID3D11DeviceContext_CSSetConstantBuffers(hv->ctx, 0, 1, &hv->statsCb);
+            ID3D11DeviceContext_Dispatch(hv->ctx, hv->tilesX, hv->tilesY, 1);
+            ID3D11DeviceContext_CSSetShaderResources(hv->ctx, 0, 1, none);
+            ID3D11DeviceContext_CSSetUnorderedAccessViews(hv->ctx, 0, 1, noUav, NULL);
+            ID3D11DeviceContext_CSSetShader(hv->ctx, NULL, NULL, 0);
+
+            ID3D11DeviceContext_CopyResource(hv->ctx, (ID3D11Resource *)hv->statsStage[slot],
+                                             (ID3D11Resource *)hv->statsBuf);
+            hv->statsPending[slot] = TRUE;
+            hv->statsNext = (slot + 1) % 3;
+            ID3D11ShaderResourceView_Release(luma);
+        }
+    }
+    ok = TRUE;
+
+done:
+    if (rtvY)  ID3D11RenderTargetView_Release(rtvY);
+    if (rtvUV) ID3D11RenderTargetView_Release(rtvUV);
+    return ok;
+}
+
+void HdrVideo_DrainLight(HdrVideo *hv)
+{
+    int i;
+    if (!hv || !hv->csStats)
+        return;
+    hv->lastPeak = 0;
+    hv->lastMean = 0.0;
+    for (i = 0; i < 3; i++)
+        HarvestSlot(hv, (hv->statsNext + i) % 3, TRUE);
+}
+
+ID3D11Texture2D *HdrVideo_RenderBgra(HdrVideo *hv)
+{
+    D3D11_MAPPED_SUBRESOURCE  map;
+    ID3D11ShaderResourceView *none[1] = { NULL };
+
+    if (!hv || !EnsureSdr(hv))
+        return NULL;
+    if (hv->sdrScale <= 0.0f)
+        hv->sdrScale = 1.0f;
+    if (SUCCEEDED(ID3D11DeviceContext_Map(hv->ctx, (ID3D11Resource *)hv->cbSdr, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+        float *p = (float *)map.pData;
+        p[0] = hv->sdrScale;
+        p[1] = hv->rollOff ? 1.0f : 0.0f;
+        p[2] = p[3] = 0.0f;
+        ID3D11DeviceContext_Unmap(hv->ctx, (ID3D11Resource *)hv->cbSdr, 0);
+    }
+    ID3D11DeviceContext_PSSetConstantBuffers(hv->ctx, 0, 1, &hv->cbSdr);
+    Pass(hv, hv->rtvSdr, hv->psSdr, hv->width, hv->height);
+    ID3D11DeviceContext_PSSetShaderResources(hv->ctx, 0, 1, none);
+    ID3D11DeviceContext_OMSetRenderTargets(hv->ctx, 0, NULL, NULL);
+    return hv->texSdr;
 }

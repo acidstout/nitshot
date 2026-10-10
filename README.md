@@ -1,6 +1,6 @@
 # Nitshot
 
-**Version 0.8.0.0 — complete**
+**Version 0.8.2.0**
 Copyright © 2026 Rekow IT
 
 A small native Win32 replacement for the Windows 10 Snipping Tool: a tray-resident
@@ -9,14 +9,24 @@ freezes and dims the desktop, and puts the result on the clipboard *and* in
 `Pictures\Nitshot`. On an HDR display it captures in floating point and
 saves real HDR files.
 
-On first start, Nitshot moves `%APPDATA%\BetterSnippingTool` to `%APPDATA%\Nitshot`, carries the
+**Formerly BetterSnippingTool.** Renamed before the first release. On first start,
+Nitshot moves `%APPDATA%\BetterSnippingTool` to `%APPDATA%\Nitshot`, carries the
 settings over from the old INI section and re-registers autostart under the new name.
 Snips already saved in `Pictures\BetterSnippingTool` stay where they are; new ones go
 to `Pictures\Nitshot`.
 
 **User guide:** [English](docs/UserGuide.en.md) · [Deutsch](docs/Benutzerhandbuch.de.md). This README is the technical reference.
 
-# Usage
+## What it does
+
+| | |
+|---|---|
+| Capture | rectangle, freeform, window, full screen — over a frozen, dimmed desktop |
+| HDR stills | fp16 capture, JPEG XR, tone-mapped PNG beside it |
+| Recording | MP4 with system sound or microphone, optional lossless WAV |
+| HDR recording | 10-bit BT.2020 PQ, HEVC Main10, encoder chosen by probing |
+| Destinations | clipboard and disk in one step |
+| Interface | tray icon, settings window, light/dark, English and German |
 
 Press the hotkey, the desktop freezes and dims, and the toolbar offers
 **rectangle · freeform · window · fullscreen · record · close**. On a display with
@@ -31,11 +41,21 @@ has their selection.
 ## The overlay
 
 One borderless window across the whole virtual desktop, drawn with D3D11 so that
-phase 4 can switch the swap chain to a floating-point format and show HDR content
-as it really looks. There is no vertex buffer and no input layout anywhere: every
-draw is a single quad built from `SV_VertexID`, with the destination and source
-rectangles coming from a constant buffer. Four small shaders, compiled at startup
-through `d3dcompiler_47.dll`, cover the entire UI.
+the swap chain can be floating point and show HDR content as it really looks.
+There is no vertex buffer and no input layout anywhere: every draw is a single
+quad built from `SV_VertexID`, with the destination and source rectangles coming
+from a constant buffer. Four small shaders cover the entire UI.
+
+**The overlay owns no device.** It draws with the one the capture machinery
+already keeps warm for Desktop Duplication, and its shaders are compiled once per
+process, off the UI thread at startup, into plain bytecode; the compiler DLL is
+released afterwards. Creating the shader objects on the current device then
+takes under a millisecond. Before, every snip created a device and compiled the
+shaders on the path between the hotkey and the overlay appearing - measured at
+about 200 ms, nearly all of it the device. A device of its own kept warm instead
+would have cost 12 MB and a few dozen driver threads at idle; borrowing costs
+nothing. Only with nothing to borrow (GDI capture) does the overlay create one,
+and it gives it back when it closes.
 
 | Mode | Behaviour |
 |---|---|
@@ -177,9 +197,8 @@ captured test tone coming back at 5838 against the 6000 it was played at.
   with real silence whenever it falls behind, or a recording of a quiet desktop
   would have no audio track and a recording whose sound paused would jump.
 - **A loopback capture is a tap on the *processed* signal**, and on a device with
-  enhancements switched on that is audible. Measured here against a flat
-  ten-tone reference played through the default endpoint (an EPOS GSX 300),
-  what came back was bent into a smile - `+17.9 dB` at 94 Hz, `+8.3` at 246,
+  enhancements switched on that is audible. Measured against a flat ten-tone
+  reference played through one such endpoint, what came back was bent into a smile - `+17.9 dB` at 94 Hz, `+8.3` at 246,
   `+4.2` at 504, `0` at 996, `−1.9` at 2004, `+4.7` at 3996, `+9.8` at 8004,
   `+8.9` at 12000, `+10.4` at 15996, `+7.6` at 19922 - before the recorder ever
   saw it. Playing such a recording back through the same endpoint applies the
@@ -267,28 +286,77 @@ captured test tone coming back at 5838 against the 6000 it was played at.
   Before this, recording used plain `DuplicateOutput`, which on an HDR display
   hands over the desktop the compositor has *already* flattened to 8-bit. That is
   where the washed-out look came from; it was never the codec.
+- **Video samples come from a pool.** A 4K frame is a 25–33 MB buffer, and
+  allocating one per frame meant the system faulting in and zero-filling every
+  page of it, every frame - over six thousand page faults per frame. Each pooled
+  sample is a Media Foundation *tracked sample*: when the writer drops its last
+  reference, it comes back to the pool instead of being destroyed, so a buffer is
+  never reused while the encoder can still read it. The pool holds at most six;
+  should all of them be in flight - the writer queues, because throttling is off
+  so a slow encoder never stalls capture - a frame gets a one-off allocation as
+  before. Measured at 3840×2160, 30 fps, interleaved against the unpooled build:
+
+  | | per frame | CPU | page faults per frame |
+  |---|---|---|---|
+  | HDR 10-bit | 26.8 → 17.1 ms | 96 % → 62 % of a core | 6,100 → ~20 |
+  | 8-bit | 21.8 → 10.2 ms | 256 % → 223 % | 8,150 → ~20–80 |
+
+  The 8-bit recording was decoded back frame for frame to check that no buffer
+  went out again too early. The pool now mostly serves the CPU path below.
+
+- **Frames stay on the GPU** (`RecordZeroCopy`, on by default). The recorder's
+  device is created video-capable and handed to the sink writer through a DXGI
+  device manager, so the hardware encoder reads our textures in place. The
+  captured frame is copied into a pooled texture on the GPU; on the 8-bit paths
+  Media Foundation's video processor then converts it to NV12 on the GPU too -
+  the RGB-to-NV12 conversion that used to run on the CPU in front of the
+  encoder. On the HDR path our own PQ shaders render straight into the planes of
+  a pooled P010 texture. MaxCLL and MaxFALL, which used to be measured on the
+  CPU while the luma plane was copied out, now come from a compute-shader
+  reduction whose results are read back a frame or two late, so measuring never
+  stalls a frame. Media Foundation drives the device from its own threads, so
+  every multi-call sequence of ours holds the device's multithread lock.
+
+  Measured at 3840×2160, 30 fps, against the CPU path in the same run:
+
+  | | GPU path | CPU path |
+  |---|---|---|
+  | HDR 10-bit | 0.08 ms/frame, 1 % CPU | 9.2 ms/frame, 35 % |
+  | 8-bit, tone-mapped from HDR | 0.04 ms/frame, 3 % | 5.8 ms/frame, 205 % |
+  | 8-bit, plain SDR capture | 0.02 ms/frame, 1 % | |
+
+  (The per-frame figures are the recorder thread's own work; encoding runs on
+  the GPU alongside.) Checked, not assumed: every file decodes frame for frame;
+  a corner square painted in two known colours comes back within 8 levels in
+  every frame on both paths, so the GPU converter uses the same matrix and range
+  as the CPU one; and the HDR light statistics match the CPU's exactly (MaxCLL
+  240 vs 240 nits, MaxFALL 2.24 vs 2.24). If the device cannot be made
+  video-capable, or the encoder will not take textures, the recording falls back
+  to the CPU path by itself; `RecordZeroCopy=0` forces that.
+
 - **The encoder list is probed, not enumerated.** `MFTEnumEx` says what the driver
-  advertises, which is not the same as what the MP4 sink will take: the
-  `NVIDIA AV1 Encoder MFT` here enumerates, configures and starts, then fails at
+  advertises, which is not the same as what the MP4 sink will take: an
+  `NVIDIA AV1 Encoder MFT` enumerates, configures and starts, then fails at
   `Finalize` with `MF_E_SINK_HEADERS_NOT_FOUND`, because the in-box MP4 sink
   cannot mux AV1. So `encoder.c` builds the list by writing and finalising a
   one-frame file per candidate through the very same configuration code
-  recording uses. On this machine that yields H.264 8-bit, HEVC 8-bit and
-  HEVC Main10, all on hardware, in 454 ms — cached in the INI against the
+  recording uses. On a current NVIDIA card that yields H.264 8-bit, HEVC 8-bit
+  and HEVC Main10, all on hardware, in 454 ms — cached in the INI against the
   adapter and its driver version, and re-probed only when either changes.
 
   Hardware encoding was already in use before any of this:
   `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS` makes Media Foundation route to
-  whichever vendor MFT is installed — NVIDIA, Intel or AMD.
-  Direct coding against the NVENC, AMF and Quick Sync SDKs directly would mean three
+  whichever vendor MFT is installed — NVIDIA's, Intel's or AMD's.
+  Coding against the NVENC, AMF and Quick Sync SDKs directly would mean three
   vendor SDKs to land exactly where `MFTEnumEx` already lands.
 
 - **"Best available" is not "newest".** On an HDR display HEVC wins outright,
-  being the only way to carry HDR here at all. On an SDR one H.264 is preferred
-  even though it is older and larger. Windows 10 needs the HEVC Video Extensions
-  package to *play* HEVC back, and plenty of upload targets reject it.
-  `RecordEncoder` overrides the ranking; a choice that stops probing clean falls
-  back down the list and says so in the log.
+  being the only way to carry HDR at all. On an SDR one H.264 is preferred
+  even though it is older and larger: Windows ships **no software HEVC
+  encoder**, Windows 10 needs the HEVC Video Extensions package to *play* HEVC
+  back (without it playback fails with `MF_E_TOPO_CODEC_NOT_FOUND`), and plenty
+  of upload targets reject it. `RecordEncoder` overrides the ranking; a choice that stops
+  probing clean falls back down the list and says so in the log.
 
 - **The container is stamped afterwards.** Media Foundation's MP4 sink writes no
   `colr` box, so nothing outside the HEVC bitstream said what the picture was, and
@@ -347,18 +415,21 @@ The hook cannot see keys while an elevated window has focus. That is a Windows
 restriction on non-elevated hooks, not something the program can work around.
 
 **A low-level hook is dispatched on the thread that installed it**, so that thread
-must never be busy. Phase 4 briefly broke this: a 4K HDR snip spent seconds in the
-encoder on the message loop, the hook could not answer within
-`LowLevelHooksTimeout`, and Windows passed Win+Shift+S to the shell — which opened
-Snip & Sketch, the one thing this program exists to prevent. Saving therefore runs
-on a worker thread (`Save_SnipAsync`), and the hook is reinstalled every 10 seconds
-as a safety net, since there is no way to ask whether it is still alive.
+must never be busy. Getting that wrong once cost the hotkey outright: a 4K HDR
+snip spent seconds in the encoder on the message loop, the hook could not answer
+within `LowLevelHooksTimeout`, and Windows passed Win+Shift+S to the shell — which
+opened Snip & Sketch, the one thing this program exists to prevent. The hook now
+lives on a **thread of its own** that does nothing else, at raised priority, so
+nothing the UI does - a cold capture, a message box, a modal dialog - can delay
+its answer. Saving still runs on worker threads (`Save_SnipAsync`), and the hook
+is still reinstalled every 10 seconds as a safety net, since there is no way to
+ask whether it is still alive.
 
 ## Why not Windows.Graphics.Capture
 
-WGC is what draws the yellow "your screen is being captured" border, and that border
-is what sometimes gets stuck (see the sibling `capturefix` tool). Nitshot
-uses DXGI Desktop Duplication, which has no such overlay.
+WGC is what draws the yellow "your screen is being captured" border, and that
+border occasionally stays on screen after the capture has ended. Nitshot uses
+DXGI Desktop Duplication, which has no such overlay.
 
 ## Building
 
@@ -367,6 +438,39 @@ uses DXGI Desktop Duplication, which has no such overlay.
 ```
 
 MSVC 2022 Build Tools, x64, `/W4 /WX`. Falls back to MinGW-w64 if MSVC is not present.
+
+```
+tests\build.bat
+```
+
+builds and runs `tests\rectest.c`, which includes `record.c`, `overlay.c` and
+`poly.c` directly so it can check their own state:
+
+- the duplication rebuild (same device, staging texture still valid);
+- the recorder's start/stop lifecycle, including the stop timeout, and a
+  recording end to end;
+- the remux failure path and the wait for pending encodes at exit;
+- the freeform rasteriser against the original implementation, and its speed;
+- that the overlay borrows the capture device and follows it when capture is
+  rebuilt, and what that saves;
+- that snips taken in the same second all keep their own files;
+- that a path-like language tag is refused.
+
+`rectest.exe b` runs only the recording benchmark instead: full-screen
+recordings on the GPU path and on the CPU path for reference - HDR, 8-bit
+tone-mapped and plain SDR capture - reporting per-frame cost, CPU use and page
+faults. The 8-bit files are decoded back to check every frame is there and that
+a square painted in two known colours survives the colour conversion; the HDR
+runs check the GPU's light statistics against the CPU's. They capture the real
+desktop, so they are deleted afterwards.
+
+`rectest.exe g` checks that the zero-copy path's prerequisites exist on the
+machine: a video-capable device, render targets on the planes of P010 and NV12
+textures, and encoders that take GPU textures and still finalise a file.
+
+It needs a desktop that is awake - a sleeping display hands Desktop Duplication
+no frames at all, and the recording check then fails for want of anything to
+encode.
 
 ## Language
 
@@ -465,10 +569,11 @@ defaults on first run.
 | `RecordHdr` | 1 | capture 10-bit HDR when the display is in it |
 | `RecordWavSidecar` | 0 | also write the untouched PCM as a `.wav` beside the `.mp4` |
 | `RecordMuxFromWav` | 0 | with the above: no live AAC; build the `.mp4`'s sound from the `.wav` afterwards |
+| `RecordZeroCopy` | 1 | frames stay on the GPU into the encoder; 0 forces the CPU path, for a driver that misbehaves |
 | `SettingsX`, `SettingsY` | *unset* | where the settings window was dragged; unset means centred |
 | `Language` | `auto` | `auto` follows Windows; otherwise a tag with a `langs\<tag>.ini` |
 | `ForceGdi` | 0 | skip Desktop Duplication and always use GDI |
-| `DebugLog` | 0 | append diagnostics to `Nitshot.log` beside this file |
+| `DebugLog` | 0 | append diagnostics to `Nitshot.log` beside this file; at 4 MB it is moved to `Nitshot.old.log` and started afresh |
 
 `DebugLog` exists because everything interesting here happens with no window on
 screen: a hotkey that never arrived and a capture that failed look identical from

@@ -27,6 +27,7 @@
 #include <dxgi1_2.h>
 #include <dxgi1_5.h>
 #include <dxgi1_6.h>      /* IDXGIOutput6, for the display's colour volume */
+#include <d3d11_4.h>      /* ID3D11Multithread                             */
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -39,6 +40,13 @@
 
 /* How long the source must have been silent before the timeline is padded,
    and how much of the recent past is left alone while doing it. */
+/* How long a stop waits for the worker before giving up on it; finalisation
+   plus an optional WAV remux of a long recording is the slow case. The test
+   harness shortens it, which is the only way to reach the timeout path. */
+#ifndef STOP_WAIT_MS
+#define STOP_WAIT_MS         15000
+#endif
+
 #define QUIET_BEFORE_PAD_MS  400
 #define PAD_LAG_MS           250
 
@@ -55,6 +63,11 @@ static void SetPacked(IMFMediaType *t, const GUID *key, UINT32 high, UINT32 low)
 typedef struct {
     /* configuration */
     RecordOptions opt;
+    /* A copy of the settings taken when the recording starts. The worker
+       reads only this, so the settings dialog can change - or be in the
+       middle of rewriting - the live ones without this thread ever seeing a
+       half-copied folder path or a choice that changed mid-recording. */
+    Settings      cfg;
     RECT          out;          /* region clipped to one output, screen coords */
     HWND          notify;
     UINT          doneMsg;
@@ -62,7 +75,14 @@ typedef struct {
     /* threading */
     HANDLE        thread;
     HANDLE        stopEvent;
-    volatile LONG active;
+    volatile LONG active;        /* frames are being captured right now      */
+    /*
+     * True from Record_Start until the worker's very last instruction.
+     * 'active' is false during setup and again during finalisation, and a
+     * second Record_Start in either window would zero this struct under a
+     * live thread - so starting and stopping go by this one instead.
+     */
+    volatile LONG busy;
     CRITICAL_SECTION writeLock; /* the sink writer is not thread safe */
     LARGE_INTEGER qpcStart, qpcFreq;
 
@@ -70,7 +90,20 @@ typedef struct {
     ID3D11Device           *dev;
     ID3D11DeviceContext    *ctx;
     IDXGIOutputDuplication *dup;
+    BOOL                    deviceLost;  /* the D3D device itself went away  */
     ID3D11Texture2D        *staging;     /* SDR path only: BGRA readback      */
+    /*
+     * The zero-copy path. Frames never come back to the CPU: they are copied
+     * or rendered into textures the encoder reads directly, through a DXGI
+     * device manager. Media Foundation then uses this device from its own
+     * threads, so every sequence of our calls on it holds 'mt'.
+     */
+    BOOL                    gpu;
+    BOOL                    devVideo;    /* the device was made video-capable */
+    IMFDXGIDeviceManager   *mgr;
+    UINT                    mgrToken;
+    ID3D11Multithread      *mt;
+    ID3D11Texture2D        *frameTex;    /* SDR capture: the current frame   */
     HdrVideo               *hv;          /* HDR path only: scRGB -> P010      */
     POINT                   outOrigin;   /* the output's top-left, screen coords */
     wchar_t                 outName[32]; /* GDI device name, for the HDR query */
@@ -95,6 +128,15 @@ typedef struct {
     EncoderId      enc;
     DWORD          videoStream, audioStream;
     UINT32         width, height;
+    LONGLONG       videoFrames;          /* written to the sink so far      */
+    /* Why frames did not arrive, summarised in the log when the file closes:
+       a recording of a still desktop and a broken capture look identical
+       from the outside otherwise. */
+    LONGLONG       grabTimeouts, grabPointerOnly, grabFailures, grabCopies;
+    /* QPC ticks spent turning captured frames into samples for the writer,
+       so the log can say what one frame costs - the figure the buffer pool
+       exists to bring down. */
+    LONGLONG       buildTicks;
     LONGLONG       audioFrames;          /* the audio timeline, in samples */
     ULONGLONG      lastAudioTick;        /* when real audio last arrived    */
     UINT32         audioRate, audioChannels;
@@ -116,6 +158,11 @@ void Record_FreeResult(RecordResult *res)
 BOOL Record_IsActive(void)
 {
     return InterlockedCompareExchange(&g_rec.active, 0, 0) != 0;
+}
+
+BOOL Record_IsBusy(void)
+{
+    return InterlockedCompareExchange(&g_rec.busy, 0, 0) != 0;
 }
 
 DWORD Record_ElapsedMs(void)
@@ -149,12 +196,25 @@ static void Fail(const wchar_t *why)
 /* Find the output containing the region's centre, and bring up duplication for
    it. A region spanning two monitors is clipped to one; recording a composite
    of several outputs would need one duplication each and a shared clock. */
-static BOOL OpenOutput(void)
+/*
+ * Finds the output the region sits on and starts duplicating it.
+ *
+ * 'reuseDevice' is what a rebuild after a lost duplication asks for. The
+ * staging texture and the HDR conversion resources belong to the device they
+ * were created on, so creating a second device here would leave the loop
+ * copying into textures the new context knows nothing about - silently, with
+ * the recording continuing on a frozen frame. A rebuild therefore keeps the
+ * device and re-duplicates the same monitor; only that monitor will do.
+ */
+static BOOL OpenOutput(BOOL reuseDevice)
 {
     IDXGIFactory1 *factory = NULL;
     POINT          centre;
     BOOL           ok = FALSE;
     UINT           ai;
+
+    if (reuseDevice && !g_rec.dev)
+        return FALSE;
 
     centre.x = (g_rec.opt.region.left + g_rec.opt.region.right) / 2;
     centre.y = (g_rec.opt.region.top + g_rec.opt.region.bottom) / 2;
@@ -177,18 +237,46 @@ static BOOL OpenOutput(void)
 
             if (IDXGIAdapter1_EnumOutputs(adapter, oi, &output) == DXGI_ERROR_NOT_FOUND)
                 break;
-            if (FAILED(IDXGIOutput_GetDesc(output, &od)) || !od.AttachedToDesktop ||
-                !PtInRect(&od.DesktopCoordinates, centre)) {
+            if (FAILED(IDXGIOutput_GetDesc(output, &od)) || !od.AttachedToDesktop) {
+                IDXGIOutput_Release(output);
+                continue;
+            }
+            /* A rebuild has to land on the monitor the recording started on;
+               a first open takes whichever one the region is centred over. */
+            if (reuseDevice ? wcscmp(od.DeviceName, g_rec.outName) != 0
+                            : !PtInRect(&od.DesktopCoordinates, centre)) {
                 IDXGIOutput_Release(output);
                 continue;
             }
 
-            if (SUCCEEDED(D3D11CreateDevice((IDXGIAdapter *)adapter,
-                                            D3D_DRIVER_TYPE_UNKNOWN, NULL,
-                                            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                                            NULL, 0, D3D11_SDK_VERSION,
-                                            &g_rec.dev, &got, &g_rec.ctx)) &&
-                SUCCEEDED(IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput1,
+            if (!reuseDevice) {
+                /* Video support is what lets the encoder take this device's
+                   textures. Asked for first, and only when wanted; a driver
+                   that refuses it still gets a device for the CPU path. */
+                HRESULT hrDev = E_FAIL;
+                g_rec.devVideo = FALSE;
+                if (g_rec.cfg.recordZeroCopy) {
+                    hrDev = D3D11CreateDevice((IDXGIAdapter *)adapter,
+                                              D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                                              D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+                                              D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                                              NULL, 0, D3D11_SDK_VERSION,
+                                              &g_rec.dev, &got, &g_rec.ctx);
+                    g_rec.devVideo = SUCCEEDED(hrDev);
+                }
+                if (FAILED(hrDev))
+                    hrDev = D3D11CreateDevice((IDXGIAdapter *)adapter,
+                                              D3D_DRIVER_TYPE_UNKNOWN, NULL,
+                                              D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                              NULL, 0, D3D11_SDK_VERSION,
+                                              &g_rec.dev, &got, &g_rec.ctx);
+                if (FAILED(hrDev)) {
+                    IDXGIOutput_Release(output);
+                    continue;
+                }
+            }
+
+            if (SUCCEEDED(IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput1,
                                                      (void **)&out1))) {
                 HRESULT hrDup = E_FAIL;
 
@@ -283,6 +371,11 @@ static BOOL OpenOutput(void)
                     ok = TRUE;
                 }
                 IDXGIOutput1_Release(out1);
+            } else if (!reuseDevice) {
+                /* No IDXGIOutput1 here: hand the device back rather than let
+                   the next candidate overwrite the pointers and strand it. */
+                ID3D11DeviceContext_Release(g_rec.ctx); g_rec.ctx = NULL;
+                ID3D11Device_Release(g_rec.dev);        g_rec.dev = NULL;
             }
             IDXGIOutput_Release(output);
         }
@@ -316,12 +409,12 @@ static BOOL MakeStaging(void)
 
 /*
  * Which encoder, and therefore which capture path. The probe in encoder.c has
- * already established what this machine can actually finalise a file with, so
+ * already established what this system can actually finalise a file with, so
  * all that is left here is to honour the setting and record what was chosen.
  */
 static BOOL ChooseEncoder(void)
 {
-    EncoderId    want = Encoder_FromToken(g_cfg.recordEncoder);
+    EncoderId    want = Encoder_FromToken(g_rec.cfg.recordEncoder);
     HdrInfo      info;
     BOOL         displayHdr = FALSE;
     MONITORINFOEXW mi;
@@ -340,7 +433,7 @@ static BOOL ChooseEncoder(void)
         StringCchCopyW(g_rec.outName, ARRAYSIZE(g_rec.outName), mi.szDevice);
 
     g_rec.sdrWhiteNits = 80.0f;
-    if (!g_cfg.forceSdr && g_rec.outName[0] &&
+    if (!g_rec.cfg.forceSdr && g_rec.outName[0] &&
         Hdr_QueryMonitor(g_rec.outName, &info) && info.active) {
         displayHdr = TRUE;
         g_rec.sdrWhiteNits = info.sdrWhiteNits;
@@ -348,7 +441,7 @@ static BOOL ChooseEncoder(void)
            duplication is simply wrong on such a display. */
         g_rec.floatCapture = TRUE;
     }
-    if (!g_cfg.recordHdr)
+    if (!g_rec.cfg.recordHdr)
         displayHdr = FALSE;      /* capture float, but write 8-bit */
 
     g_rec.enc = Encoder_Resolve(want, displayHdr);
@@ -410,7 +503,7 @@ static BOOL PickPath(wchar_t *path, size_t cch)
     SYSTEMTIME st;
     int        n;
 
-    if (!Settings_ResolveVideoFolder(dir, ARRAYSIZE(dir)))
+    if (!Settings_ResolveFolderFrom(g_rec.cfg.videoFolder, TRUE, dir, ARRAYSIZE(dir)))
         return FALSE;
 
     GetLocalTime(&st);
@@ -450,6 +543,11 @@ static BOOL OpenWriter(void)
     /* Without this the writer blocks the capture loop to pace the encoder,
        which for a live screen recording means dropped frames instead. */
     IMFAttributes_SetUINT32(attrs, &MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
+    /* With this the encoder - and on the 8-bit path the video processor in
+       front of it, which converts RGB to NV12 - work on our textures on the
+       GPU, instead of the frames making a round trip through system memory. */
+    if (g_rec.gpu && g_rec.mgr)
+        IMFAttributes_SetUnknown(attrs, &MF_SINK_WRITER_D3D_MANAGER, (IUnknown *)g_rec.mgr);
 
     if (SUCCEEDED(MFCreateSinkWriterFromURL(g_rec.result->path, NULL, attrs,
                                             &g_rec.writer)))
@@ -459,24 +557,340 @@ static BOOL OpenWriter(void)
     return ok;
 }
 
+/* ------------------------------------------------------------ sample pool */
+
+/*
+ * Video samples are recycled instead of allocated per frame.
+ *
+ * A 4K frame is a 25-33 MB buffer. Allocating one fresh for every frame meant
+ * the system handing over and zero-filling every page of it, every frame:
+ * measured at 4K30, six to eight thousand page faults per frame and over 20 ms
+ * of the 33 ms frame budget spent building the sample. A pooled buffer has its
+ * pages resident already, so the copy into it is all that is left.
+ *
+ * The writer queues samples (throttling is off, so a slow encoder never stalls
+ * the capture), which means a buffer can only be reused once the writer has
+ * finished with it. Each pooled sample is therefore a tracked sample: when the
+ * writer drops its last reference, Media Foundation calls PoolReturn instead of
+ * destroying it, and it goes back on the free list. The pool is capped; when
+ * every pooled buffer is still in flight, a frame gets a one-off allocation as
+ * before rather than waiting for one.
+ */
+#define POOL_MAX 6
+#define POOL_TEX 0x80000000u
+
+/* A buffer for one frame: system memory of 'key' bytes, or - with POOL_TEX -
+   a GPU texture of the recording's size in that format, wrapped so the
+   encoder reads it in place. */
+static HRESULT MakeBuffer(DWORD key, IMFMediaBuffer **out)
+{
+    D3D11_TEXTURE2D_DESC d;
+    ID3D11Texture2D     *tex = NULL;
+    HRESULT              hr;
+
+    *out = NULL;
+    if (!(key & POOL_TEX))
+        return MFCreateMemoryBuffer(key, out);
+
+    ZeroMemory(&d, sizeof(d));
+    d.Width            = g_rec.width;
+    d.Height           = g_rec.height;
+    d.MipLevels        = 1;
+    d.ArraySize        = 1;
+    d.Format           = (DXGI_FORMAT)(key & ~POOL_TEX);
+    d.SampleDesc.Count = 1;
+    d.Usage            = D3D11_USAGE_DEFAULT;
+    /* Rendered into on the HDR path, read by the encoder and the video
+       processor on both. */
+    d.BindFlags        = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    hr = ID3D11Device_CreateTexture2D(g_rec.dev, &d, NULL, &tex);
+    if (FAILED(hr))
+        return hr;
+    hr = MFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)tex, 0, FALSE, out);
+    ID3D11Texture2D_Release(tex);     /* the buffer holds it now */
+    return hr;
+}
+
+/* Stamped on every pooled sample, so one that comes back after its recording
+   has ended is released instead of joining the next recording's pool. */
+static const GUID POOL_GENERATION =
+    { 0x7a3c5e21, 0x4b8f, 0x4d2a, { 0x9e, 0x61, 0x0c, 0x55, 0x3b, 0xa8, 0x17, 0xd4 } };
+
+static struct {
+    SRWLOCK       lock;
+    IMFSample    *free[POOL_MAX];
+    int           freeCount;
+    int           total;          /* pooled samples in existence */
+    DWORD         key;            /* what every one of them holds: a byte
+                                     size, or POOL_TEX | a DXGI format     */
+    UINT32        generation;
+    BOOL          open;
+    volatile LONG outstanding;    /* handed to the writer, not back yet */
+    LONGLONG      reused, misses; /* for the log */
+} g_pool;
+
+static HRESULT STDMETHODCALLTYPE PoolCbQueryInterface(IMFAsyncCallback *self,
+                                                      REFIID riid, void **ppv)
+{
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IMFAsyncCallback)) {
+        *ppv = self;
+        return S_OK;
+    }
+    *ppv = NULL;
+    return E_NOINTERFACE;
+}
+
+/* A static object: nothing to count and nothing to free. */
+static ULONG STDMETHODCALLTYPE PoolCbAddRef(IMFAsyncCallback *self)
+{
+    UNREFERENCED_PARAMETER(self);
+    return 2;
+}
+
+static ULONG STDMETHODCALLTYPE PoolCbRelease(IMFAsyncCallback *self)
+{
+    UNREFERENCED_PARAMETER(self);
+    return 1;
+}
+
+static HRESULT STDMETHODCALLTYPE PoolCbGetParameters(IMFAsyncCallback *self,
+                                                     DWORD *flags, DWORD *queue)
+{
+    UNREFERENCED_PARAMETER(self);
+    UNREFERENCED_PARAMETER(flags);
+    UNREFERENCED_PARAMETER(queue);
+    return E_NOTIMPL;
+}
+
+/* Runs on a Media Foundation work-queue thread once the writer is done with a
+   sample. The result's object is the sample, with a reference that is now
+   ours. */
+static HRESULT STDMETHODCALLTYPE PoolReturn(IMFAsyncCallback *self, IMFAsyncResult *res)
+{
+    IUnknown  *obj = NULL;
+    IMFSample *sample = NULL;
+    UINT32     gen = 0;
+
+    UNREFERENCED_PARAMETER(self);
+    if (res && SUCCEEDED(IMFAsyncResult_GetObject(res, &obj)) && obj) {
+        IUnknown_QueryInterface(obj, &IID_IMFSample, (void **)&sample);
+        IUnknown_Release(obj);
+    }
+    if (!sample)
+        return S_OK;
+    IMFSample_GetUINT32(sample, &POOL_GENERATION, &gen);
+
+    AcquireSRWLockExclusive(&g_pool.lock);
+    if (g_pool.open && gen == g_pool.generation && g_pool.freeCount < POOL_MAX) {
+        g_pool.free[g_pool.freeCount++] = sample;
+        sample = NULL;
+    } else if (gen == g_pool.generation && g_pool.total > 0) {
+        g_pool.total--;
+    }
+    ReleaseSRWLockExclusive(&g_pool.lock);
+    if (gen == g_pool.generation)
+        InterlockedDecrement(&g_pool.outstanding);
+
+    if (sample)
+        IMFSample_Release(sample);   /* closed or stale: let it go for good */
+    return S_OK;
+}
+
+static IMFAsyncCallbackVtbl g_poolCbVtbl = {
+    PoolCbQueryInterface, PoolCbAddRef, PoolCbRelease, PoolCbGetParameters, PoolReturn
+};
+static IMFAsyncCallback g_poolCb = { &g_poolCbVtbl };
+
+static void PoolOpen(void)
+{
+    static UINT32 nextGeneration;
+
+    InitializeSRWLock(&g_pool.lock);
+    AcquireSRWLockExclusive(&g_pool.lock);
+    g_pool.freeCount   = 0;
+    g_pool.total       = 0;
+    g_pool.key         = 0;
+    g_pool.generation  = ++nextGeneration;
+    g_pool.open        = TRUE;
+    g_pool.reused      = 0;
+    g_pool.misses      = 0;
+    InterlockedExchange(&g_pool.outstanding, 0);
+    ReleaseSRWLockExclusive(&g_pool.lock);
+}
+
+/* Called once the writer has been released, which is what returns the
+   samples it was still holding. */
+static void PoolClose(void)
+{
+    IMFSample *drop[POOL_MAX];
+    int        n, i, waited;
+
+    AcquireSRWLockExclusive(&g_pool.lock);
+    g_pool.open = FALSE;
+    n = g_pool.freeCount;
+    for (i = 0; i < n; i++)
+        drop[i] = g_pool.free[i];
+    g_pool.freeCount = 0;
+    ReleaseSRWLockExclusive(&g_pool.lock);
+
+    for (i = 0; i < n; i++)
+        IMFSample_Release(drop[i]);
+
+    /* The last returns come in on Media Foundation's threads; they must land
+       before MFShutdown takes those threads away. */
+    for (waited = 0; waited < 2000 &&
+                     InterlockedCompareExchange(&g_pool.outstanding, 0, 0) > 0; waited += 10)
+        Sleep(10);
+    if (InterlockedCompareExchange(&g_pool.outstanding, 0, 0) > 0)
+        Log_Printf(L"record: %ld pooled sample(s) never came back",
+                   InterlockedCompareExchange(&g_pool.outstanding, 0, 0));
+    if (g_pool.reused || g_pool.misses)
+        Log_Printf(L"record: sample pool reused %lld time(s), %lld one-off allocation(s)",
+                   g_pool.reused, g_pool.misses);
+}
+
+/*
+ * A video sample with one 'size'-byte buffer, from the pool when a buffer is
+ * free. '*buf' receives that buffer with a reference the caller releases; the
+ * sample also carries a reference the caller releases once it is written.
+ */
+static IMFSample *PoolTake(DWORD key, IMFMediaBuffer **buf)
+{
+    IMFSample        *sample = NULL;
+    IMFTrackedSample *tracked = NULL;
+    IMFSample        *drop[POOL_MAX];
+    int               nDrop = 0, i;
+    BOOL              fresh = FALSE;
+
+    *buf = NULL;
+
+    AcquireSRWLockExclusive(&g_pool.lock);
+    if (g_pool.key != key) {
+        /* The frame size never changes within a recording, but should it,
+           buffers of the old size are of no use. */
+        for (i = 0; i < g_pool.freeCount; i++)
+            drop[nDrop++] = g_pool.free[i];
+        g_pool.total    -= g_pool.freeCount;
+        g_pool.freeCount = 0;
+        g_pool.key       = key;
+    }
+    if (g_pool.freeCount > 0) {
+        sample = g_pool.free[--g_pool.freeCount];
+        g_pool.reused++;
+    } else if (g_pool.open && g_pool.total < POOL_MAX) {
+        g_pool.total++;
+        fresh = TRUE;
+    }
+    ReleaseSRWLockExclusive(&g_pool.lock);
+    for (i = 0; i < nDrop; i++)
+        IMFSample_Release(drop[i]);
+
+    if (fresh) {
+        IMFMediaBuffer *mb = NULL;
+        if (SUCCEEDED(MFCreateTrackedSample(&tracked)) &&
+            SUCCEEDED(IMFTrackedSample_QueryInterface(tracked, &IID_IMFSample,
+                                                      (void **)&sample)) &&
+            SUCCEEDED(MakeBuffer(key, &mb)) &&
+            SUCCEEDED(IMFSample_AddBuffer(sample, mb)) &&
+            SUCCEEDED(IMFSample_SetUINT32(sample, &POOL_GENERATION, g_pool.generation))) {
+            /* kept: the sample now holds the buffer */
+        } else if (sample) {
+            IMFSample_Release(sample);
+            sample = NULL;
+        }
+        if (mb)
+            IMFMediaBuffer_Release(mb);
+        if (tracked) {
+            IMFTrackedSample_Release(tracked);
+            tracked = NULL;
+        }
+        if (!sample) {
+            AcquireSRWLockExclusive(&g_pool.lock);
+            g_pool.total--;
+            ReleaseSRWLockExclusive(&g_pool.lock);
+        }
+    }
+
+    if (sample) {
+        /* Arm the return for this trip; it is one-shot. */
+        if (SUCCEEDED(IMFSample_QueryInterface(sample, &IID_IMFTrackedSample,
+                                               (void **)&tracked))) {
+            if (SUCCEEDED(IMFTrackedSample_SetAllocator(tracked, &g_poolCb, NULL)))
+                InterlockedIncrement(&g_pool.outstanding);
+            IMFTrackedSample_Release(tracked);
+        }
+        if (FAILED(IMFSample_GetBufferByIndex(sample, 0, buf))) {
+            IMFSample_Release(sample);
+            return NULL;
+        }
+        return sample;
+    }
+
+    /* Every pooled buffer is still with the writer: a one-off, as before. */
+    g_pool.misses++;
+    if (FAILED(MFCreateSample(&sample)))
+        return NULL;
+    if (FAILED(MakeBuffer(key, buf)) ||
+        FAILED(IMFSample_AddBuffer(sample, *buf))) {
+        if (*buf) {
+            IMFMediaBuffer_Release(*buf);
+            *buf = NULL;
+        }
+        IMFSample_Release(sample);
+        return NULL;
+    }
+    return sample;
+}
+
+static IMFSample *PoolGet(DWORD size, IMFMediaBuffer **buf)
+{
+    return PoolTake(size, buf);
+}
+
+/* A pooled texture sample; '*tex' is the texture inside it, borrowed. */
+static IMFSample *PoolGetTex(DXGI_FORMAT fmt, IMFMediaBuffer **buf,
+                             ID3D11Texture2D **tex, DWORD *length)
+{
+    IMFSample   *sample = PoolTake(POOL_TEX | (DWORD)fmt, buf);
+    IMFDXGIBuffer *dx = NULL;
+    IMF2DBuffer   *b2 = NULL;
+
+    *tex = NULL;
+    *length = 0;
+    if (!sample)
+        return NULL;
+    if (SUCCEEDED(IMFMediaBuffer_QueryInterface(*buf, &IID_IMFDXGIBuffer, (void **)&dx))) {
+        IMFDXGIBuffer_GetResource(dx, &IID_ID3D11Texture2D, (void **)tex);
+        IMFDXGIBuffer_Release(dx);
+    }
+    if (SUCCEEDED(IMFMediaBuffer_QueryInterface(*buf, &IID_IMF2DBuffer, (void **)&b2))) {
+        IMF2DBuffer_GetContiguousLength(b2, length);
+        IMF2DBuffer_Release(b2);
+    }
+    if (!*tex) {
+        IMFMediaBuffer_Release(*buf);
+        *buf = NULL;
+        IMFSample_Release(sample);
+        return NULL;
+    }
+    /* GetResource added a reference; the buffer keeps the texture alive for
+       as long as the sample is ours, so the caller borrows it. */
+    ID3D11Texture2D_Release(*tex);
+    return sample;
+}
+
 /* ------------------------------------------------------------- the samples */
 
-/* Wraps a filled buffer as a timed sample and hands it to the writer. */
-static void SubmitVideo(IMFMediaBuffer *buf, DWORD size, LONGLONG when)
+/* Times a filled sample and hands it to the writer. */
+static void SubmitVideo(IMFSample *sample, IMFMediaBuffer *buf, DWORD size, LONGLONG when)
 {
-    IMFSample *sample = NULL;
-
     IMFMediaBuffer_SetCurrentLength(buf, size);
-    if (FAILED(MFCreateSample(&sample)))
-        return;
-    IMFSample_AddBuffer(sample, buf);
     IMFSample_SetSampleTime(sample, when);
     IMFSample_SetSampleDuration(sample, 10000000LL / g_rec.opt.fps);
 
     EnterCriticalSection(&g_rec.writeLock);
     IMFSinkWriter_WriteSample(g_rec.writer, g_rec.videoStream, sample);
     LeaveCriticalSection(&g_rec.writeLock);
-    IMFSample_Release(sample);
 }
 
 /* SDR: the staging texture's rows, stripped of their padding. */
@@ -485,8 +899,9 @@ static void WriteRgb32Sample(const BYTE *bgra, UINT32 stride, LONGLONG when)
     IMFMediaBuffer *buf = NULL;
     DWORD           size = g_rec.width * 4 * g_rec.height;
     BYTE           *dst = NULL;
+    IMFSample      *sample = PoolGet(size, &buf);
 
-    if (FAILED(MFCreateMemoryBuffer(size, &buf)))
+    if (!sample)
         return;
     if (SUCCEEDED(IMFMediaBuffer_Lock(buf, &dst, NULL, NULL))) {
         UINT32 y;
@@ -494,9 +909,10 @@ static void WriteRgb32Sample(const BYTE *bgra, UINT32 stride, LONGLONG when)
             memcpy(dst + (SIZE_T)y * g_rec.width * 4,
                    bgra + (SIZE_T)y * stride, (SIZE_T)g_rec.width * 4);
         IMFMediaBuffer_Unlock(buf);
-        SubmitVideo(buf, size, when);
+        SubmitVideo(sample, buf, size, when);
     }
     IMFMediaBuffer_Release(buf);
+    IMFSample_Release(sample);
 }
 
 /* An HDR desktop recorded as 8-bit: float in, tone-mapped on the GPU, RGB32
@@ -506,16 +922,18 @@ static void WriteToneMappedSample(LONGLONG when)
     IMFMediaBuffer *buf = NULL;
     DWORD           size = g_rec.width * 4 * g_rec.height;
     BYTE           *dst = NULL;
+    IMFSample      *sample = PoolGet(size, &buf);
 
-    if (FAILED(MFCreateMemoryBuffer(size, &buf)))
+    if (!sample)
         return;
     if (SUCCEEDED(IMFMediaBuffer_Lock(buf, &dst, NULL, NULL))) {
         BOOL ok = HdrVideo_ConvertToBgra(g_rec.hv, dst, g_rec.width * 4);
         IMFMediaBuffer_Unlock(buf);
         if (ok)
-            SubmitVideo(buf, size, when);
+            SubmitVideo(sample, buf, size, when);
     }
     IMFMediaBuffer_Release(buf);
+    IMFSample_Release(sample);
 }
 
 /* HDR: the conversion writes P010 straight into the encoder's buffer. */
@@ -524,16 +942,106 @@ static void WriteP010Sample(LONGLONG when)
     IMFMediaBuffer *buf = NULL;
     DWORD           size = g_rec.width * g_rec.height * 3;
     BYTE           *dst = NULL;
+    IMFSample      *sample = PoolGet(size, &buf);
 
-    if (FAILED(MFCreateMemoryBuffer(size, &buf)))
+    if (!sample)
         return;
     if (SUCCEEDED(IMFMediaBuffer_Lock(buf, &dst, NULL, NULL))) {
         BOOL ok = HdrVideo_ConvertToP010(g_rec.hv, dst);
         IMFMediaBuffer_Unlock(buf);
         if (ok)
-            SubmitVideo(buf, size, when);
+            SubmitVideo(sample, buf, size, when);
     }
     IMFMediaBuffer_Release(buf);
+    IMFSample_Release(sample);
+}
+
+/*
+ * The zero-copy path: the frame goes into a pooled GPU texture and from there
+ * straight to the encoder. On the 8-bit paths that texture is BGRA and Media
+ * Foundation's video processor converts it to NV12 on the GPU; on the HDR path
+ * our own shaders render P010 into it. Nothing crosses back to system memory.
+ */
+static void WriteGpuSample(LONGLONG when)
+{
+    IMFMediaBuffer  *buf = NULL;
+    ID3D11Texture2D *tex = NULL;
+    DWORD            length = 0;
+    BOOL             ok = FALSE;
+    IMFSample       *sample = PoolGetTex(g_rec.hdr ? DXGI_FORMAT_P010
+                                                   : DXGI_FORMAT_B8G8R8A8_UNORM,
+                                         &buf, &tex, &length);
+    if (!sample)
+        return;
+
+    ID3D11Multithread_Enter(g_rec.mt);
+    if (g_rec.hdr) {
+        ok = HdrVideo_RenderP010Into(g_rec.hv, tex);
+    } else if (g_rec.floatCapture) {
+        ID3D11Texture2D *src = HdrVideo_RenderBgra(g_rec.hv);
+        if (src) {
+            ID3D11DeviceContext_CopyResource(g_rec.ctx, (ID3D11Resource *)tex,
+                                             (ID3D11Resource *)src);
+            ok = TRUE;
+        }
+    } else if (g_rec.frameTex) {
+        ID3D11DeviceContext_CopyResource(g_rec.ctx, (ID3D11Resource *)tex,
+                                         (ID3D11Resource *)g_rec.frameTex);
+        ok = TRUE;
+    }
+    ID3D11Multithread_Leave(g_rec.mt);
+
+    if (ok)
+        SubmitVideo(sample, buf, length, when);
+    IMFMediaBuffer_Release(buf);
+    IMFSample_Release(sample);
+}
+
+static void TeardownGpu(void)
+{
+    if (g_rec.frameTex) { ID3D11Texture2D_Release(g_rec.frameTex);    g_rec.frameTex = NULL; }
+    if (g_rec.mgr)      { IMFDXGIDeviceManager_Release(g_rec.mgr);    g_rec.mgr      = NULL; }
+    if (g_rec.mt)       { ID3D11Multithread_Release(g_rec.mt);        g_rec.mt       = NULL; }
+    g_rec.gpu = FALSE;
+}
+
+/* Everything the zero-copy path needs beyond the device itself. FALSE leaves
+   the recorder exactly as the CPU path expects it. */
+static BOOL SetupGpu(void)
+{
+    if (!g_rec.devVideo || !g_rec.cfg.recordZeroCopy)
+        return FALSE;
+
+    if (FAILED(ID3D11DeviceContext_QueryInterface(g_rec.ctx, &IID_ID3D11Multithread,
+                                                  (void **)&g_rec.mt)))
+        goto fail;
+    /* Media Foundation calls into this device from its own threads. */
+    ID3D11Multithread_SetMultithreadProtected(g_rec.mt, TRUE);
+
+    if (FAILED(MFCreateDXGIDeviceManager(&g_rec.mgrToken, &g_rec.mgr)) ||
+        FAILED(IMFDXGIDeviceManager_ResetDevice(g_rec.mgr, (IUnknown *)g_rec.dev,
+                                                g_rec.mgrToken)))
+        goto fail;
+
+    if (!g_rec.floatCapture) {
+        D3D11_TEXTURE2D_DESC d;
+        ZeroMemory(&d, sizeof(d));
+        d.Width            = g_rec.width;
+        d.Height           = g_rec.height;
+        d.MipLevels        = 1;
+        d.ArraySize        = 1;
+        d.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.Usage            = D3D11_USAGE_DEFAULT;
+        if (FAILED(ID3D11Device_CreateTexture2D(g_rec.dev, &d, NULL, &g_rec.frameTex)))
+            goto fail;
+    }
+    g_rec.gpu = TRUE;
+    return TRUE;
+
+fail:
+    TeardownGpu();
+    return FALSE;
 }
 
 /* Write one PCM block at the current point on the audio timeline. */
@@ -655,13 +1163,27 @@ static BOOL GrabFrame(void)
     BOOL             got = FALSE;
 
     hr = IDXGIOutputDuplication_AcquireNextFrame(g_rec.dup, 0, &info, &res);
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT)
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        g_rec.grabTimeouts++;
         return FALSE;
+    }
     if (FAILED(hr)) {
         /* The mode changed or another process took exclusive control; a fresh
            duplication object is the documented recovery. */
+        g_rec.grabFailures++;
         IDXGIOutputDuplication_Release(g_rec.dup);
         g_rec.dup = NULL;
+        /*
+         * A lost *device* is a different matter: every texture and shader the
+         * loop writes through died with it, and rebuilding all of that mid-
+         * recording would change the encoder's input behind its back. Stop
+         * instead, so what has been captured so far is finalised and playable.
+         */
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+            Log_Printf(L"record: graphics device lost 0x%08lX, stopping",
+                       (unsigned long)hr);
+            g_rec.deviceLost = TRUE;
+        }
         return FALSE;
     }
 
@@ -673,6 +1195,7 @@ static BOOL GrabFrame(void)
      * do but let this one go.
      */
     if (info.LastPresentTime.QuadPart == 0) {
+        g_rec.grabPointerOnly++;
         IDXGIResource_Release(res);
         IDXGIOutputDuplication_ReleaseFrame(g_rec.dup);
         return FALSE;
@@ -681,6 +1204,7 @@ static BOOL GrabFrame(void)
     if (SUCCEEDED(IDXGIResource_QueryInterface(res, &IID_ID3D11Texture2D,
                                                (void **)&tex))) {
         ID3D11Texture2D *dest = g_rec.floatCapture ? HdrVideo_Input(g_rec.hv)
+                              : g_rec.gpu          ? g_rec.frameTex
                                                    : g_rec.staging;
         if (dest) {
             box.left   = (UINT)(g_rec.out.left   - g_rec.outOrigin.x);
@@ -693,6 +1217,7 @@ static BOOL GrabFrame(void)
                 (ID3D11Resource *)dest, 0, 0, 0, 0,
                 (ID3D11Resource *)tex, 0, &box);
             got = TRUE;
+            g_rec.grabCopies++;
         }
         ID3D11Texture2D_Release(tex);
     }
@@ -711,11 +1236,12 @@ static unsigned __stdcall RecordThread(void *arg)
     UNREFERENCED_PARAMETER(arg);
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
     MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    PoolOpen();
 
     intervalMs = (DWORD)(1000 / g_rec.opt.fps);
 
     if (!ChooseEncoder())         { Fail(Lang_Str(STR_ERR_NO_ENCODER)); goto done; }
-    if (!OpenOutput())            { Fail(Lang_Str(STR_ERR_NO_DISPLAY)); goto done; }
+    if (!OpenOutput(FALSE))       { Fail(Lang_Str(STR_ERR_NO_DISPLAY)); goto done; }
 
     /* Every codec here wants even dimensions, and 4:2:0 chroma has no meaning
        without them. */
@@ -729,7 +1255,7 @@ static unsigned __stdcall RecordThread(void *arg)
      * captured and has to be reconsidered.
      */
     if (!g_rec.hdr && Encoder_IsHdr(g_rec.enc)) {
-        EncoderId next = Encoder_Resolve(Encoder_FromToken(g_cfg.recordEncoder), FALSE);
+        EncoderId next = Encoder_Resolve(Encoder_FromToken(g_rec.cfg.recordEncoder), FALSE);
         if (next >= ENC_COUNT || Encoder_IsHdr(next))
             next = Encoder_Fallback(g_rec.enc);
         if (next >= ENC_COUNT)    { Fail(Lang_Str(STR_ERR_NO_ENCODER)); goto done; }
@@ -742,28 +1268,57 @@ static unsigned __stdcall RecordThread(void *arg)
         g_rec.hv = HdrVideo_Create(g_rec.dev, g_rec.ctx, g_rec.width, g_rec.height);
         if (!g_rec.hv) { Fail(Lang_Str(STR_ERR_HDR_SETUP)); goto done; }
         /* Only the 8-bit path uses these, but setting them is free. */
-        HdrVideo_SetSdrWhite(g_rec.hv, g_rec.sdrWhiteNits, g_cfg.hdrSdrRollOff);
+        HdrVideo_SetSdrWhite(g_rec.hv, g_rec.sdrWhiteNits, g_rec.cfg.hdrSdrRollOff);
         if (!g_rec.hdr)
             Log_Printf(L"record: float capture, tone-mapped to 8-bit at "
                        L"%.0f nits white%s", g_rec.sdrWhiteNits,
-                       g_cfg.hdrSdrRollOff ? L", highlights rolled off" : L"");
+                       g_rec.cfg.hdrSdrRollOff ? L", highlights rolled off" : L"");
     } else if (!MakeStaging()) {
         Fail(Lang_Str(STR_ERR_CAPTURE_BUF));
         goto done;
+    }
+
+    /* The CPU readback texture is dead weight - 33 MB at 4K - once frames
+       stay on the GPU; the fallback below makes another if it is needed. */
+    if (SetupGpu() && g_rec.staging) {
+        ID3D11Texture2D_Release(g_rec.staging);
+        g_rec.staging = NULL;
     }
 
     if (!OpenWriter())            { Fail(Lang_Str(STR_ERR_FILE_CREATE)); goto done; }
     if (!Encoder_AddVideoStream(g_rec.writer, g_rec.enc, g_rec.width,
                                 g_rec.height, g_rec.opt.fps,
                                 &g_rec.videoStream)) {
-        Fail(Lang_Str(STR_ERR_ENC_FORMAT));
-        goto done;
+        if (!g_rec.gpu) {
+            Fail(Lang_Str(STR_ERR_ENC_FORMAT));
+            goto done;
+        }
+        /* An encoder that will not take GPU textures is not a reason to fail
+           the recording: the CPU path has always worked with it. */
+        Log_Printf(L"record: %s refused GPU frames, using the CPU path",
+                   Encoder_Name(g_rec.enc));
+        IMFSinkWriter_Release(g_rec.writer);
+        g_rec.writer = NULL;
+        DeleteFileW(g_rec.result->path);
+        TeardownGpu();
+        if (!g_rec.floatCapture && !g_rec.staging && !MakeStaging()) {
+            Fail(Lang_Str(STR_ERR_CAPTURE_BUF));
+            goto done;
+        }
+        if (!OpenWriter())        { Fail(Lang_Str(STR_ERR_FILE_CREATE)); goto done; }
+        if (!Encoder_AddVideoStream(g_rec.writer, g_rec.enc, g_rec.width,
+                                    g_rec.height, g_rec.opt.fps,
+                                    &g_rec.videoStream)) {
+            Fail(Lang_Str(STR_ERR_ENC_FORMAT));
+            goto done;
+        }
     }
+    Log_Printf(L"record: %s path", g_rec.gpu ? L"zero-copy GPU" : L"CPU");
 
     ZeroMemory(&afmt, sizeof(afmt));
     if (g_rec.opt.audio != AUDIO_NONE) {
         /* Only meaningful with a sidecar to build the sound from. */
-        g_rec.muxFromWav = g_cfg.recordWavSidecar && g_cfg.recordMuxFromWav;
+        g_rec.muxFromWav = g_rec.cfg.recordWavSidecar && g_rec.cfg.recordMuxFromWav;
 
         if (Audio_Start(g_rec.opt.audio, &afmt, OnAudio, NULL)) {
             /*
@@ -780,7 +1335,7 @@ static unsigned __stdcall RecordThread(void *arg)
                 g_rec.audioChannels = afmt.channels;
                 g_rec.haveAudio     = TRUE;
 
-                if (g_cfg.recordWavSidecar) {
+                if (g_rec.cfg.recordWavSidecar) {
                     StringCchCopyW(g_rec.result->wavPath,
                                    ARRAYSIZE(g_rec.result->wavPath),
                                    g_rec.result->path);
@@ -825,8 +1380,16 @@ static unsigned __stdcall RecordThread(void *arg)
         LONGLONG due;
         LONGLONG now;
 
-        if (g_rec.dup && GrabFrame())
-            haveFrame = TRUE;
+        if (g_rec.dup) {
+            /* The encoder works this device from its own threads; the copy
+               out of the duplication must not interleave with its calls. */
+            if (g_rec.mt)
+                ID3D11Multithread_Enter(g_rec.mt);
+            if (GrabFrame())
+                haveFrame = TRUE;
+            if (g_rec.mt)
+                ID3D11Multithread_Leave(g_rec.mt);
+        }
 
         /*
          * Every tick writes a frame, repeating the last one when nothing
@@ -835,18 +1398,14 @@ static unsigned __stdcall RecordThread(void *arg)
          * wrongly in most players.
          */
         if (haveFrame) {
-            LONGLONG when = frameIndex * 10000000LL / g_rec.opt.fps;
-            if (g_rec.hdr) {
-                double peak = 0.0, mean = 0.0;
+            LONGLONG      when = frameIndex * 10000000LL / g_rec.opt.fps;
+            LARGE_INTEGER b0, b1;
+            QueryPerformanceCounter(&b0);
+            g_rec.videoFrames++;
+            if (g_rec.gpu) {
+                WriteGpuSample(when);
+            } else if (g_rec.hdr) {
                 WriteP010Sample(when);
-                /* MaxCLL is the brightest pixel anywhere in the recording,
-                   MaxFALL the brightest frame average - both maxima, so they
-                   only ever climb. */
-                HdrVideo_LastFrameLight(g_rec.hv, &peak, &mean);
-                if (peak > g_rec.colour.maxCLL)
-                    g_rec.colour.maxCLL = (float)peak;
-                if (mean > g_rec.colour.maxFALL)
-                    g_rec.colour.maxFALL = (float)mean;
             } else if (g_rec.floatCapture) {
                 WriteToneMappedSample(when);
             } else {
@@ -859,6 +1418,19 @@ static unsigned __stdcall RecordThread(void *arg)
                                               (ID3D11Resource *)g_rec.staging, 0);
                 }
             }
+            if (g_rec.hdr) {
+                double peak = 0.0, mean = 0.0;
+                /* MaxCLL is the brightest pixel anywhere in the recording,
+                   MaxFALL the brightest frame average - both maxima, so they
+                   only ever climb. */
+                HdrVideo_LastFrameLight(g_rec.hv, &peak, &mean);
+                if (peak > g_rec.colour.maxCLL)
+                    g_rec.colour.maxCLL = (float)peak;
+                if (mean > g_rec.colour.maxFALL)
+                    g_rec.colour.maxFALL = (float)mean;
+            }
+            QueryPerformanceCounter(&b1);
+            g_rec.buildTicks += b1.QuadPart - b0.QuadPart;
         }
         frameIndex++;
         PadAudioSilence();
@@ -875,11 +1447,30 @@ static unsigned __stdcall RecordThread(void *arg)
                 break;
         }
 
+        if (g_rec.deviceLost)
+            break;
+
         if (!g_rec.dup) {
-            /* Rebuild after a lost duplication; the file keeps running. */
-            if (!OpenOutput())
+            /* Rebuild after a lost duplication, on the same device so the
+               staging texture and the HDR resources stay valid; the file
+               keeps running meanwhile on the last frame. */
+            if (!OpenOutput(TRUE))
                 Sleep(intervalMs);
+            else
+                Log_Printf(L"record: duplication rebuilt");
         }
+    }
+
+    if (g_rec.gpu && g_rec.hdr && g_rec.hv) {
+        double peak = 0.0, mean = 0.0;
+        ID3D11Multithread_Enter(g_rec.mt);
+        HdrVideo_DrainLight(g_rec.hv);
+        HdrVideo_LastFrameLight(g_rec.hv, &peak, &mean);
+        ID3D11Multithread_Leave(g_rec.mt);
+        if (peak > g_rec.colour.maxCLL)
+            g_rec.colour.maxCLL = (float)peak;
+        if (mean > g_rec.colour.maxFALL)
+            g_rec.colour.maxFALL = (float)mean;
     }
 
     g_rec.result->seconds = Record_ElapsedMs() / 1000;
@@ -887,7 +1478,29 @@ static unsigned __stdcall RecordThread(void *arg)
 
     Audio_Stop();
     EnterCriticalSection(&g_rec.writeLock);
-    g_rec.result->ok = SUCCEEDED(IMFSinkWriter_Finalize(g_rec.writer));
+    {
+        /* Worth naming: MF_E_SINK_NO_SAMPLES_PROCESSED (0xC00D4A44) here means
+           the duplication never handed over a frame, which looks nothing like
+           an encoder problem from the outside. */
+        HRESULT hrFin;
+
+        if (g_rec.videoFrames > 0 && g_rec.qpcFreq.QuadPart > 0)
+            Log_Printf(L"record: %ux%u, %.2f ms per frame to build the sample",
+                       g_rec.width, g_rec.height,
+                       (double)g_rec.buildTicks * 1000.0 /
+                       (double)g_rec.qpcFreq.QuadPart / (double)g_rec.videoFrames);
+        Log_Printf(L"record: %lld frame(s) written; grabs: %lld copied, "
+                   L"%lld timed out, %lld pointer-only, %lld failed",
+                   (long long)g_rec.videoFrames, (long long)g_rec.grabCopies,
+                   (long long)g_rec.grabTimeouts,
+                   (long long)g_rec.grabPointerOnly,
+                   (long long)g_rec.grabFailures);
+        hrFin = IMFSinkWriter_Finalize(g_rec.writer);
+        g_rec.result->ok = SUCCEEDED(hrFin);
+        if (FAILED(hrFin))
+            Log_Printf(L"record: finalise failed 0x%08lX after %lld frame(s)",
+                       (unsigned long)hrFin, (long long)g_rec.videoFrames);
+    }
     if (g_rec.wav) {
         if (!Wav_Close(g_rec.wav))
             g_rec.result->wavPath[0] = 0;
@@ -943,8 +1556,10 @@ done:
     }
 
     if (g_rec.writer)  { IMFSinkWriter_Release(g_rec.writer);          g_rec.writer  = NULL; }
+    PoolClose();       /* after the writer: releasing it is what returns the samples */
     if (g_rec.hv)      { HdrVideo_Destroy(g_rec.hv);                   g_rec.hv      = NULL; }
     if (g_rec.staging) { ID3D11Texture2D_Release(g_rec.staging);       g_rec.staging = NULL; }
+    TeardownGpu();     /* the manager holds the device; it goes before it */
     if (g_rec.dup)     { IDXGIOutputDuplication_Release(g_rec.dup);    g_rec.dup     = NULL; }
     if (g_rec.ctx)     { ID3D11DeviceContext_Release(g_rec.ctx);       g_rec.ctx     = NULL; }
     if (g_rec.dev)     { ID3D11Device_Release(g_rec.dev);              g_rec.dev     = NULL; }
@@ -962,19 +1577,42 @@ done:
         if (res && !PostMessageW(g_rec.notify, g_rec.doneMsg, 0, (LPARAM)res))
             Record_FreeResult(res);
     }
+
+    /* Last of all: from here on the UI may start a new recording, which
+       zeroes everything above. Nothing may touch g_rec after this line. */
+    InterlockedExchange(&g_rec.busy, 0);
     return 0;
 }
 
 /* --------------------------------------------------------------- the entry */
 
+/* Hands back what Record_Start created once the worker is known to be gone. */
+static void ReleaseThreadObjects(void)
+{
+    if (g_rec.thread) {
+        CloseHandle(g_rec.thread);
+        g_rec.thread = NULL;
+    }
+    if (g_rec.stopEvent) {
+        CloseHandle(g_rec.stopEvent);
+        g_rec.stopEvent = NULL;
+        DeleteCriticalSection(&g_rec.writeLock);
+    }
+}
+
 BOOL Record_Start(HWND notify, UINT doneMsg, const RecordOptions *opt)
 {
     uintptr_t th;
 
-    if (!opt || Record_IsActive())
+    if (!opt || Record_IsBusy())
         return FALSE;
 
+    /* A previous stop that timed out left these behind on purpose. The
+       worker has since finished - busy says so - so they can go now. */
+    ReleaseThreadObjects();
+
     ZeroMemory(&g_rec, sizeof(g_rec));
+    g_rec.cfg     = g_cfg;
     g_rec.opt     = *opt;
     g_rec.notify  = notify;
     g_rec.doneMsg = doneMsg;
@@ -995,8 +1633,13 @@ BOOL Record_Start(HWND notify, UINT doneMsg, const RecordOptions *opt)
         return FALSE;
     }
 
+    /* Before the thread exists, because it is what keeps a second start out
+       while this one sets itself up. The worker clears it, and nothing else. */
+    InterlockedExchange(&g_rec.busy, 1);
+
     th = _beginthreadex(NULL, 0, RecordThread, NULL, 0, NULL);
     if (!th) {
+        InterlockedExchange(&g_rec.busy, 0);
         CloseHandle(g_rec.stopEvent);
         g_rec.stopEvent = NULL;
         DeleteCriticalSection(&g_rec.writeLock);
@@ -1012,16 +1655,22 @@ void Record_Stop(void)
 {
     if (g_rec.stopEvent)
         SetEvent(g_rec.stopEvent);
+
     if (g_rec.thread) {
         /* Waiting keeps the "it is saved" message honest: MP4 finalisation
            writes the index, without which the file will not play. */
-        WaitForSingleObject(g_rec.thread, 15000);
-        CloseHandle(g_rec.thread);
-        g_rec.thread = NULL;
+        if (WaitForSingleObject(g_rec.thread, STOP_WAIT_MS) != WAIT_OBJECT_0) {
+            /*
+             * Still working. Freeing the stop event and the lock now would
+             * pull them out from under a thread that is about to use both,
+             * so leave everything standing: the worker finishes the file on
+             * its own and clears 'busy', and the next Record_Start cleans up
+             * after it. Recording simply cannot be restarted until then.
+             */
+            Log_Printf(L"record: worker still finalising after %u ms, "
+                       L"leaving it to finish", (unsigned)STOP_WAIT_MS);
+            return;
+        }
     }
-    if (g_rec.stopEvent) {
-        CloseHandle(g_rec.stopEvent);
-        g_rec.stopEvent = NULL;
-        DeleteCriticalSection(&g_rec.writeLock);
-    }
+    ReleaseThreadObjects();
 }

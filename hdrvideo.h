@@ -72,6 +72,23 @@ BOOL HdrVideo_ConvertToBgra(HdrVideo *hv, BYTE *dst, UINT32 stride);
 void HdrVideo_LastFrameLight(const HdrVideo *hv, double *peakNits,
                              double *averageNits);
 
+/*
+ * The zero-copy path: the same conversion rendered straight into the planes of
+ * a P010 texture the encoder reads directly - nothing comes back to the CPU.
+ * The texture needs render-target and shader-resource binding.
+ *
+ * Light statistics are measured on the GPU and read back a frame or two late,
+ * so HdrVideo_LastFrameLight afterwards reports the brightest of the frames
+ * that finished since the previous call, and HdrVideo_DrainLight collects the
+ * last ones when the recording ends. The maxima come out the same.
+ */
+BOOL HdrVideo_RenderP010Into(HdrVideo *hv, ID3D11Texture2D *p010);
+void HdrVideo_DrainLight(HdrVideo *hv);
+
+/* The 8-bit tone map, left on the GPU: returns the BGRA texture it rendered,
+   owned by 'hv' and valid until the next call. */
+ID3D11Texture2D *HdrVideo_RenderBgra(HdrVideo *hv);
+
 /* A 10-bit limited-range PQ luma code as absolute luminance. */
 double HdrVideo_CodeToNits(double code);
 

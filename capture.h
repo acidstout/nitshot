@@ -68,4 +68,13 @@ BOOL Capture_VirtualDesktop(SnipImage *out, RECT *bounds);
 /* "Desktop Duplication", "Desktop Duplication (HDR)", "GDI", or "-". */
 const wchar_t *Capture_LastMethod(void);
 
+/*
+ * The D3D device the capture machinery keeps warm, with a reference added for
+ * the caller, or NULL if there is none (GDI capture, nothing initialised).
+ * The overlay draws with it rather than owning a second device: a second one
+ * costs a dozen megabytes and a few dozen driver threads for as long as the
+ * program runs. Release it with IUnknown_Release.
+ */
+struct ID3D11Device *Capture_AcquireDevice(void);
+
 #endif /* NITSHOT_CAPTURE_H */

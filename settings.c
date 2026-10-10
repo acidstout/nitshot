@@ -169,6 +169,7 @@ void Settings_Load(void)
     g_cfg.recordHdr = GetBool(L"RecordHdr", TRUE);
     g_cfg.recordWavSidecar = GetBool(L"RecordWavSidecar", FALSE);
     g_cfg.recordMuxFromWav = GetBool(L"RecordMuxFromWav", FALSE);
+    g_cfg.recordZeroCopy   = GetBool(L"RecordZeroCopy", TRUE);
 
     GetPrivateProfileStringW(SEC, L"Language", L"auto", g_cfg.language,
                              ARRAYSIZE(g_cfg.language), ini);
@@ -207,6 +208,7 @@ void Settings_Save(void)
     PutBool(L"RecordHdr", g_cfg.recordHdr);
     PutBool(L"RecordWavSidecar", g_cfg.recordWavSidecar);
     PutBool(L"RecordMuxFromWav", g_cfg.recordMuxFromWav);
+    PutBool(L"RecordZeroCopy",   g_cfg.recordZeroCopy);
     WritePrivateProfileStringW(SEC, L"Language", g_cfg.language,
                                Settings_IniPath());
     PutInt (L"SettingsX", g_cfg.settingsX);
@@ -245,6 +247,13 @@ static BOOL ResolveFolder(const wchar_t *custom, REFKNOWNFOLDERID known,
             return FALSE;
     }
     return TRUE;
+}
+
+BOOL Settings_ResolveFolderFrom(const wchar_t *custom, BOOL videos,
+                                wchar_t *out, size_t cch)
+{
+    return ResolveFolder(custom, videos ? &FOLDERID_Videos : &FOLDERID_Pictures,
+                         out, cch);
 }
 
 BOOL Settings_ResolveSaveFolder(wchar_t *out, size_t cch)

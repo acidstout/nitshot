@@ -42,8 +42,8 @@ typedef struct {
      * holds nothing: every byte zero, black with zero alpha - which the
      * overlay's premultiplied blending then draws as nothing at all, so the
      * screen goes black and every selection rectangle stays behind as a trail.
-     * Under remote desktop the pointer is reported moving all the time, and 11
-     * cold grabs in 12 came back this way.
+     * Under remote desktop the pointer is reported moving all the time, where
+     * 11 of 12 cold grabs came back this way.
      */
     BOOL                    hasImage;
     HdrInfo                 hdr;
@@ -367,12 +367,14 @@ static BOOL GrabViaGdi(SnipImage *img, const RECT *vb)
             GdiFlush();
             memcpy(img->pixels, bits, (SIZE_T)img->stride * img->height);
             /* BitBlt leaves the alpha byte at zero; PNG and CF_DIBV5 both take
-               that literally, so force the image opaque. */
+               that literally, so force the image opaque - a word at a time,
+               which on a 4K desktop is the difference between a loop the
+               compiler can vectorise and 33 million byte stores. */
             for (y = 0; y < img->height; y++) {
-                BYTE  *p   = img->pixels + (SIZE_T)y * img->stride;
-                UINT32 x;
+                UINT32 *p = (UINT32 *)(img->pixels + (SIZE_T)y * img->stride);
+                UINT32  x;
                 for (x = 0; x < img->width; x++)
-                    p[x * 4 + 3] = 0xFF;
+                    p[x] |= 0xFF000000u;
             }
             ok = TRUE;
         }
@@ -477,6 +479,14 @@ const wchar_t *Capture_LastMethod(void)
     return g_method;
 }
 
+struct ID3D11Device *Capture_AcquireDevice(void)
+{
+    if (g_outCount < 1 || !g_out[0].dev)
+        return NULL;
+    ID3D11Device_AddRef(g_out[0].dev);
+    return g_out[0].dev;
+}
+
 BOOL Capture_VirtualDesktop(SnipImage *out, RECT *bounds)
 {
     RECT vb;
@@ -493,9 +503,21 @@ BOOL Capture_VirtualDesktop(SnipImage *out, RECT *bounds)
        than left describing a display state that no longer exists. */
     if (!g_cfg.forceGdi) {
         BOOL wantHdr = !g_cfg.forceSdr && Hdr_AnyDisplayActive();
-        if (g_inited && wantHdr != g_hdrMode) {
-            Log_Printf(L"capture: advanced colour changed (%d -> %d), rebuilding",
-                       (int)g_hdrMode, (int)wantHdr);
+        BOOL lost    = FALSE;
+
+        /* An output whose duplication could not be recreated is dead until
+           everything is rebuilt; checking here means the snip in hand gets
+           the fast path back instead of quietly falling to GDI. */
+        for (i = 0; i < g_outCount; i++)
+            if (!g_out[i].dup)
+                lost = TRUE;
+
+        if (g_inited && (wantHdr != g_hdrMode || lost)) {
+            if (wantHdr != g_hdrMode)
+                Log_Printf(L"capture: advanced colour changed (%d -> %d), rebuilding",
+                           (int)g_hdrMode, (int)wantHdr);
+            else
+                Log_Printf(L"capture: a duplication was lost, rebuilding");
             Capture_Shutdown();
         }
         Capture_Init();
@@ -523,6 +545,15 @@ BOOL Capture_VirtualDesktop(SnipImage *out, RECT *bounds)
                                 : L"Desktop Duplication";
             return TRUE;
         }
+        /*
+         * Something no longer matches - the desktop changed shape, an output
+         * went away, a mode switch is half done. GDI covers this snip; tearing
+         * the duplication down means the next one rebuilds it to fit the
+         * desktop as it now is, instead of every snip from here on taking the
+         * slow path.
+         */
+        Log_Printf(L"capture: duplication failed, GDI this time, rebuilding next");
+        Capture_Shutdown();
     }
 
     /* GDI has no floating-point path at all, so falling back also means

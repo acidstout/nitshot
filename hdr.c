@@ -20,12 +20,15 @@ static BOOL QueryPaths(DISPLAYCONFIG_PATH_INFO **paths, UINT32 *pathCount,
                        DISPLAYCONFIG_MODE_INFO **modes, UINT32 *modeCount)
 {
     LONG rc;
+    int  attempt;
 
     *paths = NULL;
     *modes = NULL;
 
-    /* The buffer can grow between the sizing call and the query, so retry. */
-    for (;;) {
+    /* The buffer can grow between the sizing call and the query, so retry -
+       a bounded number of times: a topology that keeps changing under us
+       (a dock being plugged in, a driver resetting) must not spin forever. */
+    for (attempt = 0; attempt < 8; attempt++) {
         if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, pathCount, modeCount)
                 != ERROR_SUCCESS)
             return FALSE;
@@ -54,6 +57,7 @@ static BOOL QueryPaths(DISPLAYCONFIG_PATH_INFO **paths, UINT32 *pathCount,
         if (rc != ERROR_INSUFFICIENT_BUFFER)
             return FALSE;
     }
+    return FALSE;
 }
 
 static void ReadPath(const DISPLAYCONFIG_PATH_INFO *p, HdrInfo *out)

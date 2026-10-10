@@ -2,7 +2,7 @@
  * encoder.h - which video encoder the recorder can actually use.
  *
  * Enumerating MFTs says what a driver advertises, which is not the same thing
- * as what the MP4 sink will accept: this machine's NVIDIA AV1 Encoder MFT
+ * as what the MP4 sink will accept. NVIDIA's AV1 Encoder MFT, for one,
  * enumerates, configures and starts, then fails at Finalize with
  * MF_E_SINK_HEADERS_NOT_FOUND because the in-box MP4 sink cannot mux AV1. So
  * the list offered in Settings is built by *probing* - writing and finalising a

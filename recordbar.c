@@ -244,7 +244,7 @@ BOOL RecordBar_Show(HWND owner, const RECT *region, UINT stopMsg)
     dpi = 96;
     {
         HMONITOR mon = MonitorFromRect(region, MONITOR_DEFAULTTONEAREST);
-        HMODULE  shc = LoadLibraryW(L"shcore.dll");
+        HMODULE  shc = LoadLibraryExW(L"shcore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (shc) {
             typedef HRESULT (WINAPI *PFN)(HMONITOR, int, UINT *, UINT *);
             PFN f = (PFN)(void *)GetProcAddress(shc, "GetDpiForMonitor");

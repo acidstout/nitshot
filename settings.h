@@ -37,6 +37,8 @@ typedef struct {
     wchar_t  recordEncoder[16]; /* EncoderId token: auto / h264 / hevc8 / hevc10 */
     BOOL     recordHdr;         /* capture 10-bit HDR when the display is in it */
     BOOL     recordWavSidecar;  /* also write the untouched PCM beside the MP4 */
+    BOOL     recordZeroCopy;    /* frames stay on the GPU into the encoder;
+                                   off forces the older CPU path */
     BOOL     recordMuxFromWav;  /* ...and build the MP4's AAC from that WAV
                                    afterwards, so nothing encodes audio live */
 
@@ -72,6 +74,12 @@ BOOL Settings_ResolveSaveFolder(wchar_t *out, size_t cch);
 /* The same for recordings. Unlike snips, a recording is always written to
    disk, so this does not depend on saveToDisk. */
 BOOL Settings_ResolveVideoFolder(wchar_t *out, size_t cch);
+
+/* The same, for a folder taken from a settings snapshot rather than g_cfg.
+   The save and record workers resolve their folders this way, so a change
+   made in the settings dialog meanwhile can never reach them half-written. */
+BOOL Settings_ResolveFolderFrom(const wchar_t *custom, BOOL videos,
+                                wchar_t *out, size_t cch);
 
 /* The built-in default for either folder, ignoring any custom one - what a
    setting is compared against to decide whether it is really a custom path. */

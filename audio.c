@@ -185,6 +185,8 @@ BOOL Audio_Start(AudioSource src, AudioFormat *fmt, AudioSinkFn sink, void *ctx)
     if (src == AUDIO_NONE || !fmt || !sink)
         return FALSE;
     Audio_Stop();
+    if (g_thread)
+        return FALSE;      /* the previous capture thread is still winding down */
 
     if (FAILED(CoCreateInstance(&CLSID_MMDeviceEnumerator_, NULL, CLSCTX_ALL,
                                 &IID_IMMDeviceEnumerator_, (void **)&devEnum)))
@@ -204,14 +206,14 @@ BOOL Audio_Start(AudioSource src, AudioFormat *fmt, AudioSinkFn sink, void *ctx)
      *
      * This matters more than it sounds. A loopback capture taps what the audio
      * engine is playing, and on a device with enhancements switched on that is
-     * the *processed* signal - measured here, a bass and treble lift of up to
-     * 18 dB against the middle. Recording that and then playing the recording
+     * the *processed* signal - on one measured headset amplifier, a bass and
+     * treble lift of up to 18 dB against the middle. Recording that and then playing the recording
      * back through the same enhancements applies the curve twice, which is
      * exactly the muddy, damped sound the whole thing was reported for.
      *
-     * Not every driver honours it - the EPOS GSX 300 here answers
-     * AUDCLNT_E_RAW_MODE_UNSUPPORTED (0x88890027) and keeps its effects in the
-     * chain - so a refusal is logged and otherwise ignored. On such a device
+     * Not every driver honours it - plenty answer
+     * AUDCLNT_E_RAW_MODE_UNSUPPORTED (0x88890027) and keep their effects in
+     * the chain - so a refusal is logged and otherwise ignored. On such a device
      * the only way to record the untouched signal is to turn the endpoint's
      * enhancements off in Sound settings.
      */
@@ -298,7 +300,19 @@ void Audio_Stop(void)
     if (g_stopEvent)
         SetEvent(g_stopEvent);
     if (g_thread) {
-        WaitForSingleObject(g_thread, 2000);
+        /*
+         * The capture loop wakes every 10 ms and only ever waits on the stop
+         * event, so it is gone well inside this. If it is not, releasing the
+         * client and the capture service would pull them out from under it -
+         * a crash rather than a slow stop. The thread reads these globals on
+         * every pass, so they are left exactly as they are: it will see the
+         * stop event and leave, and the next stop finishes the cleanup.
+         * Audio_Start refuses to run while that is still pending.
+         */
+        if (WaitForSingleObject(g_thread, 2000) != WAIT_OBJECT_0) {
+            Log_Printf(L"audio: capture thread did not stop in time");
+            return;
+        }
         CloseHandle(g_thread);
         g_thread = NULL;
     }

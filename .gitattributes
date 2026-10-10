@@ -1,0 +1,8 @@
+# cmd.exe needs CRLF in batch files or it mis-parses multi-line blocks
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+*.c    text eol=lf
+*.h    text eol=lf
+*.rc   text eol=lf
+*.md   text eol=lf
+*.ico  binary

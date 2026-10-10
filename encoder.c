@@ -27,6 +27,22 @@
 
 static EncoderCaps g_caps;
 static LONG        g_probing;
+
+/*
+ * Read without the lock on the fast path, so it is read and written as an
+ * atomic: the probe thread sets it only after every capability field is in
+ * place, and a reader that sees it set must see those fields too.
+ */
+static BOOL IsProbed(void)
+{
+    return InterlockedCompareExchange((volatile LONG *)&g_caps.probed, 0, 0) != 0;
+}
+
+static void SetProbed(void)
+{
+    InterlockedExchange((volatile LONG *)&g_caps.probed, 1);
+}
+
 /* The warm-up thread and a settings dialog can both ask at once, and they
    would otherwise be filling g_caps.mft[][] at the same time. */
 static SRWLOCK     g_lock = SRWLOCK_INIT;
@@ -365,7 +381,7 @@ static BOOL LoadCache(const wchar_t *key)
         g_caps.hardware[id] = GetPrivateProfileIntW(CACHE_SEC, name, 0,
                                                     Settings_IniPath()) != 0;
     }
-    g_caps.probed = TRUE;
+    SetProbed();
     return TRUE;
 }
 
@@ -397,11 +413,11 @@ void Encoder_Probe(BOOL force)
     EncoderId id;
     ULONGLONG t0;
 
-    if (g_caps.probed && !force)
+    if (IsProbed() && !force)
         return;
 
     AcquireSRWLockExclusive(&g_lock);
-    if (g_caps.probed && !force) {       /* another thread got there first */
+    if (IsProbed() && !force) {          /* another thread got there first */
         ReleaseSRWLockExclusive(&g_lock);
         return;
     }
@@ -424,7 +440,7 @@ void Encoder_Probe(BOOL force)
     for (id = ENC_H264; id < ENC_COUNT; id++)
         g_caps.usable[id] = ProbeOne(id, dir);
 
-    g_caps.probed = TRUE;
+    SetProbed();
     SaveCache(key);
     Log_Printf(L"encoder: probe took %lu ms on %s",
                (unsigned long)(GetTickCount64() - t0), key);
@@ -447,7 +463,7 @@ void Encoder_ProbeAsync(void)
 {
     uintptr_t th;
 
-    if (g_caps.probed)
+    if (IsProbed())
         return;
     if (InterlockedCompareExchange(&g_probing, 1, 0) != 0)
         return;
@@ -462,11 +478,11 @@ void Encoder_ProbeAsync(void)
 
 /*
  * Best first, and "best" is not simply "newest". HEVC is the only way to carry
- * HDR here, so on an HDR display it wins outright. On an SDR one H.264 is
- * preferred despite being the older and larger codec: this machine has no
- * software HEVC encoder at all, Windows 10 needs the HEVC Video Extensions
- * package to play HEVC back in Photos or Films & TV, and a good many upload
- * targets reject it. The user can still pick HEVC explicitly.
+ * HDR, so on an HDR display it wins outright. On an SDR one H.264 is preferred
+ * despite being the older and larger codec: HEVC encoding needs hardware -
+ * Windows ships no software HEVC encoder - Windows 10 needs the HEVC Video
+ * Extensions package to play HEVC back in Photos or Films & TV, and a good many
+ * upload targets reject it. The setting can still pick HEVC explicitly.
  */
 static const EncoderId g_rankHdr[] = { ENC_HEVC10, ENC_H264,  ENC_HEVC8 };
 static const EncoderId g_rankSdr[] = { ENC_H264,   ENC_HEVC8, ENC_HEVC10 };
@@ -477,7 +493,7 @@ EncoderId Encoder_Resolve(EncoderId want, BOOL hdr)
     const int        n = 3;
     int              i;
 
-    if (!g_caps.probed)
+    if (!IsProbed())
         Encoder_Probe(FALSE);
 
     /* An explicit choice is honoured whenever it works. */

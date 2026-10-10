@@ -312,8 +312,9 @@ static void FillAudioBox(HWND dlg)
 
 /*
  * Only encoders that actually probed clean are offered. The probe is what
- * separates "the driver advertises it" from "a file comes out": the AV1
- * encoder on this machine passes the first test and fails the second.
+ * separates "the driver advertises it" from "a file comes out": an AV1
+ * encoder typically passes the first test and fails the second, because the
+ * in-box MP4 sink cannot mux AV1.
  *
  * Probing costs a couple of seconds, so it runs here, where opening a settings
  * dialog already implies a wait, rather than at startup.

@@ -51,16 +51,19 @@ static unsigned FindSampleEntry(const BYTE *buf, unsigned base, unsigned end,
         unsigned size = RdU32(buf + p);
         unsigned body = p + 8;
 
-        if (size < 8 || p + size > end)
+        /* Compared as a difference: 'p + size' wraps for a corrupt size near
+           4 GB and would sail past the check it is meant to be. */
+        if (size < 8 || size > end - p)
             return 0;
 
         if (IsType(buf + p, "hvc1") || IsType(buf + p, "hev1") ||
             IsType(buf + p, "avc1")) {
             /* VisualSampleEntry is 78 bytes before its child boxes start. */
             unsigned c = body + 78;
-            while (c + 8 <= p + size) {
+            unsigned e = p + size;           /* in range: checked above */
+            while (c < e && e - c >= 8) {
                 unsigned csz = RdU32(buf + c);
-                if (csz < 8 || c + csz > p + size)
+                if (csz < 8 || csz > e - c)
                     break;
                 if (IsType(buf + c, "colr")) {
                     *alreadyTagged = TRUE;

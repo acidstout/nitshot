@@ -4,8 +4,9 @@
  * Both destinations go through one call, because they share the encoded PNG.
  * Encoding a 4K screen twice cost more than the capture itself.
  *
- * Phase 4 adds the HDR side (JPEG XR plus a tone-mapped sidecar); the
- * clipboard stays SDR either way, because Windows has no HDR clipboard format.
+ * On an HDR display a snip is written as JPEG XR, with a tone-mapped PNG
+ * beside it; the clipboard stays SDR either way, because Windows has no HDR
+ * clipboard format.
  */
 #ifndef NITSHOT_SAVE_H
 #define NITSHOT_SAVE_H
@@ -54,6 +55,13 @@ BOOL Save_Snip(HWND owner, const SnipImage *img, SaveResult *res);
 BOOL Save_SnipAsync(HWND notify, UINT doneMsg, SnipImage *img);
 
 void Save_FreeResult(SaveResult *res);
+
+/*
+ * Waits until every Save_SnipAsync encode has finished, or the timeout runs
+ * out; TRUE if they are all done. Called before the process exits, because a
+ * JPEG XR encode outlives the click that quit the program by seconds.
+ */
+BOOL Save_WaitForPending(DWORD timeoutMs);
 
 /* Write one SDR image straight to a path as PNG, ignoring the settings. Used
    by the overlay's debug back-buffer dump. */

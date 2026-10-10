@@ -1,7 +1,7 @@
 /*
  * overlay.c - the frozen, dimmed desktop and the selection on top of it.
  *
- * Rendered with D3D11 rather than GDI so that phase 4 can switch the swap chain
+ * Rendered with D3D11 rather than GDI so that the swap chain can switch
  * to a floating-point format and show HDR content as it really looks. There is
  * no vertex buffer and no input layout anywhere: every draw is one quad built
  * from SV_VertexID, with the destination and source rectangles coming from a
@@ -17,6 +17,7 @@
 #include "settings.h"
 #include "save.h"
 #include "hdr.h"
+#include "capture.h"
 #include "log.h"
 
 #include <windowsx.h>
@@ -29,6 +30,7 @@
 #include <dwmapi.h>
 #include <shlwapi.h>      /* PathFindFileNameW, for naming who took focus */
 #include <strsafe.h>
+#include <process.h>
 
 /* Points closer together than this are dropped while drawing freehand: it
    keeps the outline from collecting hundreds of duplicates during a slow drag. */
@@ -138,9 +140,46 @@ typedef struct {
     ULONGLONG shownAt;              /* GetTickCount64 when it appeared     */
     int       reclaims;             /* activation taken back in the grace  */
     BOOL      done, taken;
+    /* Only once Overlay_Run's own message loop is running may WM_DESTROY post
+       WM_QUIT. Before that - a window torn down because D3D would not start -
+       the quit message would land in the caller's loop instead, and that loop
+       is the application's: the whole program would exit. */
+    BOOL      looping;
 } Overlay;
 
 static Overlay g_ov;
+
+/*
+ * The parts of the D3D setup that do not depend on one snip.
+ *
+ * Compiling the four shaders is the expensive part - about two hundred
+ * milliseconds, on the path between the hotkey and the overlay appearing - so
+ * it happens once per process, into plain bytecode, and the compiler DLL is
+ * let go again. The device is not ours at all: the capture machinery already
+ * keeps one warm for Desktop Duplication, and drawing with that one costs
+ * nothing at idle, where a second device of our own held a dozen megabytes
+ * and a few dozen driver threads for as long as the program ran. Creating the
+ * shader objects from bytecode on whatever device is current takes about a
+ * millisecond.
+ */
+typedef struct { BYTE *code; SIZE_T size; } Bytecode;
+
+enum { BC_VS, BC_TEX, BC_SOLID, BC_MASK, BC_COUNT };
+
+static Bytecode  g_bc[BC_COUNT];
+static INIT_ONCE g_bcOnce = INIT_ONCE_STATIC_INIT;
+static BOOL      g_bcOk;
+
+static struct {
+    ID3D11Device        *dev;      /* a reference of our own, borrowed or not */
+    ID3D11DeviceContext *ctx;
+    BOOL                 own;      /* created here because capture had none */
+    ID3D11VertexShader  *vs;
+    ID3D11PixelShader   *psTex, *psSolid, *psMask;
+    ID3D11Buffer        *cb;
+    ID3D11BlendState    *blend;
+    ID3D11SamplerState  *samp;
+} g_sh;
 
 /* ------------------------------------------------------------- helpers */
 
@@ -326,56 +365,213 @@ static void PolyReset(void)
 
 /* -------------------------------------------------------------- device */
 
-static BOOL CompileShaders(void)
+static BOOL CALLBACK CompileOnce(PINIT_ONCE once, PVOID param, PVOID *ctx)
 {
-    HMODULE lib;
-    pD3DCompile compile;
-    ID3DBlob   *vsb = NULL, *psa = NULL, *psb = NULL, *psc = NULL, *err = NULL;
-    BOOL        ok = FALSE;
+    static const char *const entry[BC_COUNT]   = { "VSMain", "PSTex", "PSSolid", "PSMask" };
+    static const char *const target[BC_COUNT]  = { "vs_4_0", "ps_4_0", "ps_4_0", "ps_4_0" };
     const UINT  flags = D3DCOMPILE_OPTIMIZATION_LEVEL3 | D3DCOMPILE_ENABLE_STRICTNESS;
+    HMODULE     lib;
+    pD3DCompile compile;
+    int         i;
+    BOOL        ok = TRUE;
 
-    /* Loaded by name rather than linked: the import library is versioned and
-       the DLL is in System32 on every supported Windows. */
-    lib = LoadLibraryW(L"d3dcompiler_47.dll");
+    UNREFERENCED_PARAMETER(once);
+    UNREFERENCED_PARAMETER(param);
+    UNREFERENCED_PARAMETER(ctx);
+
+    /*
+     * Loaded by name rather than linked: the import library is versioned and
+     * the DLL is in System32 on every supported Windows. From System32 *only* -
+     * a plain LoadLibrary searches the exe's own folder first, and a copy of
+     * this program run from Downloads would load any d3dcompiler_47.dll that
+     * happened to be lying next to it.
+     */
+    lib = LoadLibraryExW(L"d3dcompiler_47.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!lib)
-        return FALSE;
+        return TRUE;                  /* g_bcOk stays FALSE */
     compile = (pD3DCompile)(void *)GetProcAddress(lib, "D3DCompile");
-    if (!compile)
+
+    for (i = 0; i < BC_COUNT && ok && compile; i++) {
+        ID3DBlob *code = NULL, *err = NULL;
+        if (FAILED(compile(g_hlsl, sizeof(g_hlsl) - 1, NULL, NULL, NULL,
+                           entry[i], target[i], flags, 0, &code, &err))) {
+            if (err)
+                Log_Printf(L"overlay: shader compile failed: %S",
+                           (const char *)ID3D10Blob_GetBufferPointer(err));
+            ok = FALSE;
+        } else {
+            g_bc[i].size = ID3D10Blob_GetBufferSize(code);
+            g_bc[i].code = (BYTE *)HeapAlloc(GetProcessHeap(), 0, g_bc[i].size);
+            if (g_bc[i].code)
+                memcpy(g_bc[i].code, ID3D10Blob_GetBufferPointer(code), g_bc[i].size);
+            else
+                ok = FALSE;
+        }
+        RELEASE(err);
+        RELEASE(code);
+    }
+    /* The blobs are gone, so nothing of the compiler is still in use. */
+    FreeLibrary(lib);
+    g_bcOk = ok && compile != NULL;
+    return TRUE;
+}
+
+/* Blocks only if a prewarm is compiling at this very moment. */
+static BOOL EnsureBytecode(void)
+{
+    InitOnceExecuteOnce(&g_bcOnce, CompileOnce, NULL, NULL);
+    return g_bcOk;
+}
+
+static void ReleaseShared(void)
+{
+    if (g_sh.ctx) {
+        ID3D11DeviceContext_ClearState(g_sh.ctx);
+        ID3D11DeviceContext_Flush(g_sh.ctx);
+    }
+    RELEASE(g_sh.cb);
+    RELEASE(g_sh.samp);
+    RELEASE(g_sh.blend);
+    RELEASE(g_sh.psMask);
+    RELEASE(g_sh.psSolid);
+    RELEASE(g_sh.psTex);
+    RELEASE(g_sh.vs);
+    RELEASE(g_sh.ctx);
+    RELEASE(g_sh.dev);
+    g_sh.own = FALSE;
+}
+
+/* The shaders and fixed pipeline state, on whichever device g_sh holds. */
+static BOOL BuildPipeline(void)
+{
+    D3D11_BLEND_DESC   bd;
+    D3D11_SAMPLER_DESC sm;
+    D3D11_BUFFER_DESC  cbd;
+
+    if (FAILED(ID3D11Device_CreateVertexShader(g_sh.dev, g_bc[BC_VS].code,
+                                               g_bc[BC_VS].size, NULL, &g_sh.vs)))
+        return FALSE;
+    if (FAILED(ID3D11Device_CreatePixelShader(g_sh.dev, g_bc[BC_TEX].code,
+                                              g_bc[BC_TEX].size, NULL, &g_sh.psTex)))
+        return FALSE;
+    if (FAILED(ID3D11Device_CreatePixelShader(g_sh.dev, g_bc[BC_SOLID].code,
+                                              g_bc[BC_SOLID].size, NULL, &g_sh.psSolid)))
+        return FALSE;
+    if (FAILED(ID3D11Device_CreatePixelShader(g_sh.dev, g_bc[BC_MASK].code,
+                                              g_bc[BC_MASK].size, NULL, &g_sh.psMask)))
         return FALSE;
 
-    if (FAILED(compile(g_hlsl, sizeof(g_hlsl) - 1, NULL, NULL, NULL,
-                       "VSMain", "vs_4_0", flags, 0, &vsb, &err))) goto done;
-    if (FAILED(compile(g_hlsl, sizeof(g_hlsl) - 1, NULL, NULL, NULL,
-                       "PSTex", "ps_4_0", flags, 0, &psa, &err)))  goto done;
-    if (FAILED(compile(g_hlsl, sizeof(g_hlsl) - 1, NULL, NULL, NULL,
-                       "PSSolid", "ps_4_0", flags, 0, &psb, &err))) goto done;
-    if (FAILED(compile(g_hlsl, sizeof(g_hlsl) - 1, NULL, NULL, NULL,
-                       "PSMask", "ps_4_0", flags, 0, &psc, &err)))  goto done;
+    ZeroMemory(&bd, sizeof(bd));
+    bd.RenderTarget[0].BlendEnable           = TRUE;
+    bd.RenderTarget[0].SrcBlend              = D3D11_BLEND_ONE;   /* premultiplied */
+    bd.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ONE;
+    bd.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_INV_SRC_ALPHA;
+    bd.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
+    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+    if (FAILED(ID3D11Device_CreateBlendState(g_sh.dev, &bd, &g_sh.blend)))
+        return FALSE;
 
-    if (FAILED(ID3D11Device_CreateVertexShader(g_ov.dev,
-            ID3D10Blob_GetBufferPointer(vsb), ID3D10Blob_GetBufferSize(vsb),
-            NULL, &g_ov.vs))) goto done;
-    if (FAILED(ID3D11Device_CreatePixelShader(g_ov.dev,
-            ID3D10Blob_GetBufferPointer(psa), ID3D10Blob_GetBufferSize(psa),
-            NULL, &g_ov.psTex))) goto done;
-    if (FAILED(ID3D11Device_CreatePixelShader(g_ov.dev,
-            ID3D10Blob_GetBufferPointer(psb), ID3D10Blob_GetBufferSize(psb),
-            NULL, &g_ov.psSolid))) goto done;
-    if (FAILED(ID3D11Device_CreatePixelShader(g_ov.dev,
-            ID3D10Blob_GetBufferPointer(psc), ID3D10Blob_GetBufferSize(psc),
-            NULL, &g_ov.psMask))) goto done;
-    ok = TRUE;
+    ZeroMemory(&sm, sizeof(sm));
+    sm.Filter   = D3D11_FILTER_MIN_MAG_MIP_POINT;   /* 1:1, so no filtering */
+    sm.AddressU = sm.AddressV = sm.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sm.MaxLOD   = D3D11_FLOAT32_MAX;
+    if (FAILED(ID3D11Device_CreateSamplerState(g_sh.dev, &sm, &g_sh.samp)))
+        return FALSE;
 
-done:
-    if (!ok && err)
-        Log_Printf(L"overlay: shader compile failed: %S",
-                   (const char *)ID3D10Blob_GetBufferPointer(err));
-    RELEASE(err);
-    RELEASE(vsb);
-    RELEASE(psa);
-    RELEASE(psb);
-    RELEASE(psc);
-    return ok;
+    ZeroMemory(&cbd, sizeof(cbd));
+    cbd.ByteWidth      = sizeof(ShaderCB);
+    cbd.Usage          = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    return SUCCEEDED(ID3D11Device_CreateBuffer(g_sh.dev, &cbd, NULL, &g_sh.cb));
+}
+
+/*
+ * Makes sure there is a working device with the pipeline built on it.
+ *
+ * Normally that is the capture machinery's device; when capture is rebuilt -
+ * HDR switched, a display changed, a recording took the outputs - it has a new
+ * one, and the pipeline follows it. Only with nothing to borrow (GDI capture)
+ * does the overlay create a device itself, and that one is dropped again when
+ * the overlay closes, so it costs nothing at idle either.
+ */
+static BOOL EnsureShared(void)
+{
+    ID3D11Device     *cap;
+    D3D_FEATURE_LEVEL fl;
+
+    if (!EnsureBytecode())
+        return FALSE;
+
+    if (g_sh.dev) {
+        HRESULT why = ID3D11Device_GetDeviceRemovedReason(g_sh.dev);
+        if (FAILED(why)) {
+            Log_Printf(L"overlay: device was removed (0x%08lX), rebuilding",
+                       (unsigned long)why);
+            ReleaseShared();
+        }
+    }
+
+    cap = (ID3D11Device *)Capture_AcquireDevice();
+    if (cap) {
+        if (g_sh.dev == cap) {
+            ID3D11Device_Release(cap);     /* we already hold one */
+            return TRUE;
+        }
+        ReleaseShared();
+        g_sh.dev = cap;                    /* the reference Acquire gave us */
+        ID3D11Device_GetImmediateContext(g_sh.dev, &g_sh.ctx);
+        g_sh.own = FALSE;
+    } else {
+        if (g_sh.dev)
+            return TRUE;
+        if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                                     D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
+                                     D3D11_SDK_VERSION, &g_sh.dev, &fl, &g_sh.ctx)))
+            return FALSE;
+        g_sh.own = TRUE;
+    }
+
+    if (!BuildPipeline()) {
+        ReleaseShared();
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static unsigned __stdcall PrewarmThread(void *arg)
+{
+    UNREFERENCED_PARAMETER(arg);
+    if (!EnsureBytecode())
+        Log_Printf(L"overlay: prewarm failed, the first snip will compile");
+    return 0;
+}
+
+void Overlay_Prewarm(void)
+{
+    /* Off the UI thread: compiling is a couple of hundred milliseconds of
+       CPU, and nothing at startup has to wait for it. */
+    uintptr_t th = _beginthreadex(NULL, 0, PrewarmThread, NULL, 0, NULL);
+    if (th)
+        CloseHandle((HANDLE)th);
+}
+
+void Overlay_Shutdown(void)
+{
+    int i;
+
+    ReleaseShared();
+    /* Waits out a prewarm still compiling, so the bytecode is not freed
+       under it. */
+    EnsureBytecode();
+    for (i = 0; i < BC_COUNT; i++) {
+        if (g_bc[i].code)
+            HeapFree(GetProcessHeap(), 0, g_bc[i].code);
+        g_bc[i].code = NULL;
+        g_bc[i].size = 0;
+    }
 }
 
 static BOOL CreateDesktopTexture(void)
@@ -487,23 +683,35 @@ static BOOL UploadToolbar(void)
              * point of drawing it at 4x - come out the wrong brightness.
              */
             {
+                /* sRGB to linear for every 8-bit level, built once: the curve
+                   is a pow() per channel, and the toolbar is re-uploaded on
+                   every hover change. */
+                static float lin8[256];
+                static BOOL  lin8Ready;
                 UINT16 *d16   = (UINT16 *)dstRow;
                 float   white = WhiteScale();
                 int     x;
+
+                if (!lin8Ready) {
+                    int k;
+                    for (k = 0; k < 256; k++)
+                        lin8[k] = Hdr_SrgbToLinear((float)k / 255.0f);
+                    lin8Ready = TRUE;
+                }
                 for (x = 0; x < w; x++) {
-                    float a = srcRow[x * 4 + 3] / 255.0f;
-                    int   i;
+                    unsigned a8 = srcRow[x * 4 + 3];
+                    float    a  = (float)a8 / 255.0f;
+                    int      i;
                     for (i = 0; i < 3; i++) {
-                        /* source is BGRA, destination RGBA */
-                        float c = srcRow[x * 4 + (2 - i)] / 255.0f;
-                        float lin;
-                        if (a > 0.0f) {
-                            c /= a;
-                            if (c > 1.0f)
-                                c = 1.0f;
+                        /* source is BGRA, destination RGBA; un-premultiply on
+                           the integer scale so the table can be used */
+                        unsigned c8 = srcRow[x * 4 + (2 - i)];
+                        if (a8 > 0) {
+                            c8 = (c8 * 255u + a8 / 2u) / a8;
+                            if (c8 > 255u)
+                                c8 = 255u;
                         }
-                        lin = Hdr_SrgbToLinear(c) * white * a;
-                        d16[x * 4 + i] = Hdr_FloatToHalf(lin);
+                        d16[x * 4 + i] = Hdr_FloatToHalf(lin8[c8] * white * a);
                     }
                     d16[x * 4 + 3] = Hdr_FloatToHalf(a);
                 }
@@ -553,20 +761,26 @@ static void UploadMask(const RECT *box)
 static BOOL CreateDevice(void)
 {
     DXGI_SWAP_CHAIN_DESC1 sd;
-    D3D_FEATURE_LEVEL     fl;
     IDXGIDevice          *dxgiDev = NULL;
     IDXGIAdapter         *adapter = NULL;
     IDXGIFactory2        *factory = NULL;
     ID3D11Texture2D      *back    = NULL;
-    D3D11_BLEND_DESC      bd;
-    D3D11_SAMPLER_DESC    sm;
-    D3D11_BUFFER_DESC     cbd;
     BOOL                  ok = FALSE;
 
-    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
-                                 D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
-                                 D3D11_SDK_VERSION, &g_ov.dev, &fl, &g_ov.ctx)))
-        goto done;
+    if (!EnsureShared())
+        return FALSE;
+
+    /* Borrowed for this run, not owned: DestroyDevice lets go without
+       releasing them. Keeping the names lets the rendering code stay as is. */
+    g_ov.dev     = g_sh.dev;
+    g_ov.ctx     = g_sh.ctx;
+    g_ov.vs      = g_sh.vs;
+    g_ov.psTex   = g_sh.psTex;
+    g_ov.psSolid = g_sh.psSolid;
+    g_ov.psMask  = g_sh.psMask;
+    g_ov.cb      = g_sh.cb;
+    g_ov.blend   = g_sh.blend;
+    g_ov.samp    = g_sh.samp;
 
     if (FAILED(ID3D11Device_QueryInterface(g_ov.dev, &IID_IDXGIDevice, (void **)&dxgiDev)))
         goto done;
@@ -623,36 +837,8 @@ static BOOL CreateDevice(void)
                                                    NULL, &g_ov.rtv)))
         goto done;
 
-    if (!CompileShaders() || !CreateDesktopTexture())
+    if (!CreateDesktopTexture())
         goto done;
-
-    ZeroMemory(&bd, sizeof(bd));
-    bd.RenderTarget[0].BlendEnable           = TRUE;
-    bd.RenderTarget[0].SrcBlend              = D3D11_BLEND_ONE;   /* premultiplied */
-    bd.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
-    bd.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
-    bd.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ONE;
-    bd.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_INV_SRC_ALPHA;
-    bd.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
-    bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    if (FAILED(ID3D11Device_CreateBlendState(g_ov.dev, &bd, &g_ov.blend)))
-        goto done;
-
-    ZeroMemory(&sm, sizeof(sm));
-    sm.Filter   = D3D11_FILTER_MIN_MAG_MIP_POINT;   /* 1:1, so no filtering */
-    sm.AddressU = sm.AddressV = sm.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    sm.MaxLOD   = D3D11_FLOAT32_MAX;
-    if (FAILED(ID3D11Device_CreateSamplerState(g_ov.dev, &sm, &g_ov.samp)))
-        goto done;
-
-    ZeroMemory(&cbd, sizeof(cbd));
-    cbd.ByteWidth      = sizeof(ShaderCB);
-    cbd.Usage          = D3D11_USAGE_DYNAMIC;
-    cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
-    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    if (FAILED(ID3D11Device_CreateBuffer(g_ov.dev, &cbd, NULL, &g_ov.cb)))
-        goto done;
-
     ok = TRUE;
 
 done:
@@ -663,25 +849,29 @@ done:
     return ok;
 }
 
+/* Lets go of this run's objects. The device and its pipeline state are kept
+   for the next snip; only the pointers to them are forgotten here. */
 static void DestroyDevice(void)
 {
+    /* The context still has this run's render target and textures bound, and
+       a bound view keeps its resource - and through it the swap chain and the
+       window's surface - alive. Unbind before releasing. */
+    if (g_ov.ctx) {
+        ID3D11DeviceContext_ClearState(g_ov.ctx);
+        ID3D11DeviceContext_Flush(g_ov.ctx);
+    }
     RELEASE(g_ov.srvMask);
     RELEASE(g_ov.texMask);
     RELEASE(g_ov.srvToolbar);
     RELEASE(g_ov.texToolbar);
     RELEASE(g_ov.srvDesktop);
     RELEASE(g_ov.texDesktop);
-    RELEASE(g_ov.cb);
-    RELEASE(g_ov.samp);
-    RELEASE(g_ov.blend);
-    RELEASE(g_ov.psMask);
-    RELEASE(g_ov.psSolid);
-    RELEASE(g_ov.psTex);
-    RELEASE(g_ov.vs);
     RELEASE(g_ov.rtv);
     RELEASE(g_ov.swap);
-    RELEASE(g_ov.ctx);
-    RELEASE(g_ov.dev);
+
+    g_ov.dev = NULL;   g_ov.ctx = NULL;
+    g_ov.vs = NULL;    g_ov.psTex = g_ov.psSolid = g_ov.psMask = NULL;
+    g_ov.cb = NULL;    g_ov.blend = NULL;   g_ov.samp = NULL;
 }
 
 /* ------------------------------------------------------------ rendering */
@@ -1190,7 +1380,8 @@ static LRESULT CALLBACK OverlayProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_WATCHDOG);
-        PostQuitMessage(0);
+        if (g_ov.looping)
+            PostQuitMessage(0);
         return 0;
 
     default:
@@ -1285,17 +1476,22 @@ static void ForceForeground(HWND hwnd)
 
 static UINT DpiForPoint(POINT screen)
 {
-    HMONITOR mon = MonitorFromPoint(screen, MONITOR_DEFAULTTONEAREST);
-    HMODULE  shc = LoadLibraryW(L"shcore.dll");
-    UINT     x = 96, y = 96;
+    typedef HRESULT (WINAPI *PFN)(HMONITOR, int, UINT *, UINT *);
+    static PFN  f;
+    static BOOL looked;
+    HMONITOR    mon = MonitorFromPoint(screen, MONITOR_DEFAULTTONEAREST);
+    UINT        x = 96, y = 96;
 
-    if (shc) {
-        typedef HRESULT (WINAPI *PFN)(HMONITOR, int, UINT *, UINT *);
-        PFN f = (PFN)(void *)GetProcAddress(shc, "GetDpiForMonitor");
-        if (f)
-            f(mon, 0 /* MDT_EFFECTIVE_DPI */, &x, &y);
-        FreeLibrary(shc);
+    /* Looked up once and kept: shcore stays loaded for the process anyway,
+       and from System32 only, for the same reason as the shader compiler. */
+    if (!looked) {
+        HMODULE shc = LoadLibraryExW(L"shcore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        looked = TRUE;
+        if (shc)
+            f = (PFN)(void *)GetProcAddress(shc, "GetDpiForMonitor");
     }
+    if (f)
+        f(mon, 0 /* MDT_EFFECTIVE_DPI */, &x, &y);
     return x ? x : 96;
 }
 
@@ -1357,11 +1553,21 @@ BOOL Overlay_Run(const SnipImage *frozen, const RECT *bounds, SnipMode start,
     if (!g_ov.hwnd)
         return FALSE;
 
-    if (!CreateDevice()) {
-        Log_Printf(L"overlay: D3D init failed");
-        DestroyWindow(g_ov.hwnd);
-        DestroyDevice();
-        return FALSE;
+    {
+        LARGE_INTEGER f, t0, t1;
+        BOOL          warm = g_sh.dev != NULL;
+        QueryPerformanceFrequency(&f);
+        QueryPerformanceCounter(&t0);
+        if (!CreateDevice()) {
+            Log_Printf(L"overlay: D3D init failed");
+            DestroyDevice();
+            DestroyWindow(g_ov.hwnd);
+            return FALSE;
+        }
+        QueryPerformanceCounter(&t1);
+        Log_Printf(L"overlay: D3D ready in %.1f ms (%s device)",
+                   (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart,
+                   warm ? L"warm" : L"new");
     }
 
     GetCursorPos(&cur);
@@ -1386,10 +1592,12 @@ BOOL Overlay_Run(const SnipImage *frozen, const RECT *bounds, SnipMode start,
     SetTimer(g_ov.hwnd, TIMER_WATCHDOG, WATCHDOG_MS, NULL);
     Render();
 
+    g_ov.looping = TRUE;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    g_ov.looping = FALSE;
 
     sel->taken  = g_ov.taken;
     sel->record = g_ov.recordMode;
@@ -1409,6 +1617,8 @@ BOOL Overlay_Run(const SnipImage *frozen, const RECT *bounds, SnipMode start,
     }
 
     DestroyDevice();
+    if (g_sh.own)
+        ReleaseShared();
     return TRUE;
 }
 

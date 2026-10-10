@@ -29,9 +29,23 @@ static const wchar_t *const g_keys[STR_COUNT] = {
 #undef BSNIP_KEY
 };
 
-/* Loaded overrides; NULL means "use the English above". */
-static wchar_t *g_loaded[STR_COUNT];
-static wchar_t  g_current[8] = L"en";
+/*
+ * Loaded overrides; a NULL entry means "use the English above".
+ *
+ * A language switch builds a complete new table and swaps it in with one
+ * pointer exchange. The old table is not freed but retired: the recorder and
+ * the save workers call Lang_Str on their own threads, and a string they are
+ * in the middle of copying must not vanish because someone picked another
+ * language in Settings. Switches are rare and a table is a few kilobytes, so
+ * the retired ones simply wait for Lang_Shutdown at exit.
+ */
+typedef struct LangTable {
+    wchar_t          *s[STR_COUNT];
+    struct LangTable *retired;     /* the chain of tables replaced before it */
+} LangTable;
+
+static LangTable *volatile g_table;
+static wchar_t             g_current[8] = L"en";
 
 const wchar_t *Lang_Current(void)
 {
@@ -40,9 +54,13 @@ const wchar_t *Lang_Current(void)
 
 const wchar_t *Lang_Str(StringId id)
 {
+    LangTable *t;
+
     if (id < 0 || id >= STR_COUNT)
         return L"";
-    return g_loaded[id] ? g_loaded[id] : g_english[id];
+    t = (LangTable *)InterlockedCompareExchangePointer((PVOID volatile *)&g_table,
+                                                       NULL, NULL);
+    return (t && t->s[id]) ? t->s[id] : g_english[id];
 }
 
 /* ------------------------------------------------------------- formatting */
@@ -57,6 +75,10 @@ const wchar_t *Lang_Format(wchar_t *buf, size_t cch, StringId id, ...)
 
     if (!buf || cch == 0)
         return L"";
+    if (id < 0 || id >= STR_COUNT) {
+        buf[0] = 0;
+        return buf;
+    }
 
     /*
      * The argument list is read eagerly and only as far as the highest
@@ -207,7 +229,7 @@ static wchar_t *ReadUtf8(const wchar_t *path)
     return text;
 }
 
-static void Store(StringId id, const wchar_t *value)
+static void Store(LangTable *t, StringId id, const wchar_t *value)
 {
     size_t   n = wcslen(value) + 1;
     wchar_t *copy = (wchar_t *)HeapAlloc(GetProcessHeap(), 0, n * sizeof(wchar_t));
@@ -215,13 +237,22 @@ static void Store(StringId id, const wchar_t *value)
     if (!copy)
         return;
     memcpy(copy, value, n * sizeof(wchar_t));
-    if (g_loaded[id])
-        HeapFree(GetProcessHeap(), 0, g_loaded[id]);
-    g_loaded[id] = copy;
+    if (t->s[id])
+        HeapFree(GetProcessHeap(), 0, t->s[id]);
+    t->s[id] = copy;
+}
+
+static void FreeTable(LangTable *t)
+{
+    int i;
+    for (i = 0; i < STR_COUNT; i++)
+        if (t->s[i])
+            HeapFree(GetProcessHeap(), 0, t->s[i]);
+    HeapFree(GetProcessHeap(), 0, t);
 }
 
 /* Returns the number of keys understood, or -1 if the file could not be read. */
-static int LoadFile(const wchar_t *path)
+static int LoadFile(LangTable *t, const wchar_t *path)
 {
     wchar_t *text = ReadUtf8(path);
     wchar_t *line, *next;
@@ -258,7 +289,7 @@ static int LoadFile(const wchar_t *path)
             if (_wcsicmp(line, g_keys[i]) == 0) {
                 /* An empty value means "no translation", not "empty label". */
                 if (eq[1])
-                    Store((StringId)i, eq + 1);
+                    Store(t, (StringId)i, eq + 1);
                 taken++;
                 break;
             }
@@ -287,15 +318,40 @@ static void CodeFromWindows(wchar_t *out, size_t cch)
         StringCchCopyW(out, cch, L"en");
 }
 
-static BOOL TryLoad(const wchar_t *code)
+/*
+ * A language tag is letters, digits and hyphens - en, de, pt-BR, zh-Hant. It
+ * goes into a file name, and the value comes from an INI anyone can edit, so
+ * anything else ("..\\..\\x") is refused rather than allowed to walk out of
+ * the langs folder.
+ */
+static BOOL IsValidTag(const wchar_t *code)
+{
+    int i;
+    if (!code || !code[0])
+        return FALSE;
+    for (i = 0; code[i]; i++) {
+        wchar_t c = code[i];
+        if (i >= 7)
+            return FALSE;
+        if (!((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') ||
+              (c >= L'0' && c <= L'9') || c == L'-' || c == L'_'))
+            return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL TryLoad(LangTable *t, const wchar_t *code)
 {
     wchar_t dir[MAX_PATH], path[MAX_PATH];
     int     n;
 
+    if (!IsValidTag(code))
+        return FALSE;
+
     /* The user's folder first, so a shipped translation can be replaced. */
     if (LangDir(dir, ARRAYSIZE(dir), TRUE) &&
         SUCCEEDED(StringCchPrintfW(path, MAX_PATH, L"%s\\%s.ini", dir, code))) {
-        n = LoadFile(path);
+        n = LoadFile(t, path);
         if (n >= 0) {
             Log_Printf(L"lang: %s, %d string(s) from %s", code, n, path);
             return TRUE;
@@ -303,7 +359,7 @@ static BOOL TryLoad(const wchar_t *code)
     }
     if (LangDir(dir, ARRAYSIZE(dir), FALSE) &&
         SUCCEEDED(StringCchPrintfW(path, MAX_PATH, L"%s\\%s.ini", dir, code))) {
-        n = LoadFile(path);
+        n = LoadFile(t, path);
         if (n >= 0) {
             Log_Printf(L"lang: %s, %d string(s) from %s", code, n, path);
             return TRUE;
@@ -314,26 +370,30 @@ static BOOL TryLoad(const wchar_t *code)
 
 void Lang_Init(const wchar_t *code)
 {
-    wchar_t want[8];
+    wchar_t    want[8];
+    LangTable *t, *old;
 
-    Lang_Shutdown();
+    t = (LangTable *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*t));
+    if (!t)
+        return;                       /* keep whatever is loaded now */
 
-    if (code && code[0] && _wcsicmp(code, L"auto") != 0)
+    if (code && code[0] && _wcsicmp(code, L"auto") != 0 && IsValidTag(code))
         StringCchCopyW(want, ARRAYSIZE(want), code);
     else
         CodeFromWindows(want, ARRAYSIZE(want));
 
-    if (TryLoad(want)) {
-        StringCchCopyW(g_current, ARRAYSIZE(g_current), want);
-        return;
+    if (!TryLoad(t, want)) {
+        /* No file for that language. English is compiled in, so this is not a
+           failure - it is simply what an untranslated build looks like. */
+        if (_wcsicmp(want, L"en") != 0)
+            Log_Printf(L"lang: no file for %s, using the built-in English", want);
+        StringCchCopyW(want, ARRAYSIZE(want), L"en");
+        TryLoad(t, L"en");
     }
+    StringCchCopyW(g_current, ARRAYSIZE(g_current), want);
 
-    /* No file for that language. English is compiled in, so this is not a
-       failure - it is simply what an untranslated build looks like. */
-    if (_wcsicmp(want, L"en") != 0)
-        Log_Printf(L"lang: no file for %s, using the built-in English", want);
-    StringCchCopyW(g_current, ARRAYSIZE(g_current), L"en");
-    TryLoad(L"en");
+    old = (LangTable *)InterlockedExchangePointer((PVOID volatile *)&g_table, t);
+    t->retired = old;
 }
 
 int Lang_List(wchar_t codes[][8], int max)
@@ -378,12 +438,11 @@ int Lang_List(wchar_t codes[][8], int max)
 
 void Lang_Shutdown(void)
 {
-    int i;
-
-    for (i = 0; i < STR_COUNT; i++) {
-        if (g_loaded[i]) {
-            HeapFree(GetProcessHeap(), 0, g_loaded[i]);
-            g_loaded[i] = NULL;
-        }
+    LangTable *t = (LangTable *)InterlockedExchangePointer((PVOID volatile *)&g_table,
+                                                           NULL);
+    while (t) {
+        LangTable *next = t->retired;
+        FreeTable(t);
+        t = next;
     }
 }

@@ -7,15 +7,31 @@
 #include "settings.h"
 #include "log.h"
 
+#include <process.h>
+
 /* Stamped on the keystrokes we inject ourselves, so the hook can skip exactly
    those. Filtering on LLKHF_INJECTED instead would be wrong: remote-desktop
    hosts (CRD, RDP shadowing, VMs) deliver every real keypress as injected, and
    the hotkey has to keep working in those sessions. */
 #define BSNIP_INJECT_TAG  ((ULONG_PTR)0x42534E50)   /* 'BSNP' */
 
-static HHOOK g_hook;
-static HWND  g_notify;
-static BOOL  g_suppressed;
+/*
+ * The hook lives on a thread of its own that does nothing else.
+ *
+ * A low-level hook is called on the thread that installed it, and Windows
+ * gives that thread LowLevelHooksTimeout to answer before passing the key on
+ * without it - after which Win+Shift+S reaches the shell and Snip & Sketch
+ * opens. On the UI thread that budget is shared with everything the UI does:
+ * a grab of a cold duplication, a message box, a modal dialog's own work. Here
+ * nothing can delay the answer but the hook itself.
+ */
+static HHOOK         g_hook;          /* owned by the hook thread only */
+static HWND          g_notify;
+static volatile LONG g_suppressed;
+static HANDLE        g_thread;
+static DWORD         g_threadId;
+
+#define WM_HK_REINSTALL (WM_APP + 1)  /* posted to the hook thread */
 
 /* Key-downs we swallowed, so the matching key-up can be swallowed too and no
    application is left thinking the key is still held. Four slots is more than
@@ -95,7 +111,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wp, LPARAM lp)
                     !Down(VK_CONTROL) && !Down(VK_MENU)) {
                     if (RememberEaten((BYTE)k->vkCode)) {
                         ConsumeWinChord();
-                        if (g_suppressed)
+                        if (InterlockedCompareExchange(&g_suppressed, 0, 0))
                             Log_Printf(L"hotkey: Win+Shift+S eaten (overlay up)");
                         else
                             PostMessageW(g_notify, WM_BSNIP_TRIGGER,
@@ -109,7 +125,7 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wp, LPARAM lp)
                     !Down(VK_MENU)) {   /* Alt+PrtScn stays the OS's window grab */
                     if (!RememberEaten((BYTE)k->vkCode))
                         Log_Printf(L"hotkey: PrtScn eaten (still held)");
-                    else if (g_suppressed)
+                    else if (InterlockedCompareExchange(&g_suppressed, 0, 0))
                         Log_Printf(L"hotkey: PrtScn eaten (overlay up)");
                     else
                         PostMessageW(g_notify, WM_BSNIP_TRIGGER, TRIGGER_PRINTSCREEN, 0);
@@ -123,45 +139,110 @@ static LRESULT CALLBACK LowLevelKeyboardProc(int code, WPARAM wp, LPARAM lp)
     return CallNextHookEx(NULL, code, wp, lp);
 }
 
-BOOL Hotkey_Install(HWND notify)
+/* Runs on the hook thread. Install before unhooking, so a failed reinstall
+   leaves the working hook in place instead of silently disarming the keys. */
+static BOOL InstallHere(void)
 {
-    HHOOK old = g_hook;
-    HHOOK fresh;
+    HHOOK fresh = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+                                    GetModuleHandleW(NULL), 0);
+    if (!fresh)
+        return g_hook != NULL;
+    if (g_hook)
+        UnhookWindowsHookEx(g_hook);
+    g_hook = fresh;
+    /*
+     * The held-key table deliberately survives a reinstall. Reinstalling runs
+     * every ten seconds as a safety net, and a key held across one of those
+     * ticks would otherwise look released: its key-up would reach the
+     * foreground app bare, and the next autorepeat would count as a fresh
+     * press. Uninstall clears the table, because then nothing is swallowed.
+     */
+    return TRUE;
+}
 
-    /* Set first: the new hook can fire the moment it exists. */
-    g_notify = notify;
+typedef struct {
+    HANDLE ready;     /* set once the first install has been tried */
+    BOOL   ok;
+} HookStart;
 
-    fresh = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
-                              GetModuleHandleW(NULL), 0);
-    if (!fresh) {
-        /* Install before unhooking, so a failed reinstall leaves the working
-           hook in place instead of silently disarming the hotkeys. */
-        return old != NULL;
+static unsigned __stdcall HookThread(void *arg)
+{
+    HookStart *start = (HookStart *)arg;
+    MSG        msg;
+
+    /* It does almost nothing, but when it does, it is on every keystroke the
+       user types; under load it should not queue behind the rest of us. */
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
+    /* A message queue has to exist before anyone may post to this thread. */
+    PeekMessageW(&msg, NULL, WM_USER, WM_USER, PM_NOREMOVE);
+    start->ok = InstallHere();
+    SetEvent(start->ready);          /* 'start' is not ours after this */
+
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        if (msg.message == WM_HK_REINSTALL)
+            InstallHere();
     }
 
-    g_hook = fresh;
-    if (old)
-        UnhookWindowsHookEx(old);
-    ZeroMemory(g_eaten, sizeof(g_eaten));
-    return TRUE;
+    if (g_hook) {
+        UnhookWindowsHookEx(g_hook);
+        g_hook = NULL;
+    }
+    return 0;
+}
+
+BOOL Hotkey_Install(HWND notify)
+{
+    HookStart start;
+    uintptr_t th;
+
+    /* Set first: the hook can fire the moment it exists. */
+    g_notify = notify;
+
+    if (g_thread) {
+        PostThreadMessageW(g_threadId, WM_HK_REINSTALL, 0, 0);
+        return TRUE;
+    }
+
+    start.ok    = FALSE;
+    start.ready = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!start.ready)
+        return FALSE;
+
+    th = _beginthreadex(NULL, 0, HookThread, &start, 0, (unsigned *)&g_threadId);
+    if (!th) {
+        CloseHandle(start.ready);
+        return FALSE;
+    }
+    g_thread = (HANDLE)th;
+    /* The caller reports a failed hook to the user, so the answer has to be
+       known before returning. The thread is about to signal, never block. */
+    WaitForSingleObject(start.ready, INFINITE);
+    CloseHandle(start.ready);
+    if (!start.ok)
+        Hotkey_Uninstall();
+    return start.ok;
 }
 
 void Hotkey_Uninstall(void)
 {
-    if (g_hook) {
-        UnhookWindowsHookEx(g_hook);
-        g_hook = NULL;
+    if (g_thread) {
+        PostThreadMessageW(g_threadId, WM_QUIT, 0, 0);
+        WaitForSingleObject(g_thread, 2000);
+        CloseHandle(g_thread);
+        g_thread   = NULL;
+        g_threadId = 0;
     }
     ZeroMemory(g_eaten, sizeof(g_eaten));
 }
 
 void Hotkey_Refresh(void)
 {
-    if (g_notify)
-        Hotkey_Install(g_notify);
+    if (g_thread)
+        PostThreadMessageW(g_threadId, WM_HK_REINSTALL, 0, 0);
 }
 
 void Hotkey_SetSuppressed(BOOL suppressed)
 {
-    g_suppressed = suppressed;
+    InterlockedExchange(&g_suppressed, suppressed ? 1 : 0);
 }

@@ -125,8 +125,15 @@ BOOL Wav_Write(WavSink *w, const BYTE *pcm16, UINT32 frames)
             left -= chunk;
         }
     }
-    if (ok)
+    if (ok) {
         w->dataBytes += bytes;
+    } else {
+        /* A write that failed once - a full disk, a pulled USB stick - will
+           fail again on every packet; stop rather than hammer it, and keep
+           the header describing what actually reached the file. */
+        Log_Printf(L"wav: write failed (%lu), sidecar stops here", GetLastError());
+        w->full = TRUE;
+    }
     return ok;
 }
 

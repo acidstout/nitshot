@@ -37,8 +37,8 @@ static BOOL OpenVideoReader(const wchar_t *path, IMFSourceReader **reader,
     if (FAILED(MFCreateAttributes(&attrs, 1)))
         return FALSE;
     /* Deliberately no decoding and no video processing: leaving the stream
-       alone is the entire point, and on this machine there is no HEVC decoder
-       to invoke even if we wanted one. */
+       alone is the entire point, and a machine without an HEVC decoder has
+       none to invoke anyway. */
     hr = MFCreateSourceReaderFromURL(path, attrs, reader);
     IMFAttributes_Release(attrs);
     if (FAILED(hr)) {
@@ -252,35 +252,53 @@ static BOOL AddAacStream(IMFSinkWriter *writer, IMFMediaType *pcm, DWORD *index)
 }
 
 /*
- * Reads one sample and writes it on. Returns FALSE when that stream is spent.
- * 'when' receives the sample's timestamp so the caller can keep the two
- * streams roughly level and stop the sink buffering a whole recording.
+ * Reads one sample and writes it on. 'when' receives the sample's timestamp so
+ * the caller can keep the two streams roughly level and stop the sink
+ * buffering a whole recording.
+ *
+ * Reaching the end of a stream and failing to read it look alike from the
+ * caller's side - both mean "no more samples from here" - but only one of them
+ * may produce a file. They are told apart here, because a truncated recording
+ * that reports success would be replaced over the intact original and its
+ * sidecar deleted.
  */
-static BOOL PumpOne(IMFSourceReader *reader, DWORD srcStream,
-                    IMFSinkWriter *writer, DWORD dstStream, LONGLONG *when)
+typedef enum { PUMP_MORE, PUMP_END, PUMP_FAILED } PumpState;
+
+static PumpState PumpOne(IMFSourceReader *reader, DWORD srcStream,
+                         IMFSinkWriter *writer, DWORD dstStream, LONGLONG *when)
 {
     IMFSample *sample = NULL;
     DWORD      actual = 0, flags = 0;
     LONGLONG   ts = 0;
-    BOOL       more = TRUE;
+    PumpState  state = PUMP_MORE;
+    HRESULT    hr;
 
-    if (FAILED(IMFSourceReader_ReadSample(reader, srcStream, 0, &actual, &flags,
-                                          &ts, &sample)))
-        return FALSE;
+    hr = IMFSourceReader_ReadSample(reader, srcStream, 0, &actual, &flags,
+                                    &ts, &sample);
+    if (FAILED(hr)) {
+        Log_Printf(L"remux: reading stream %lu failed 0x%08lX",
+                   (unsigned long)srcStream, (unsigned long)hr);
+        return PUMP_FAILED;
+    }
 
     if (flags & MF_SOURCE_READERF_ENDOFSTREAM)
-        more = FALSE;
+        state = PUMP_END;
 
     if (sample) {
-        IMFSinkWriter_WriteSample(writer, dstStream, sample);
+        hr = IMFSinkWriter_WriteSample(writer, dstStream, sample);
         IMFSample_Release(sample);
+        if (FAILED(hr)) {
+            Log_Printf(L"remux: writing stream %lu failed 0x%08lX",
+                       (unsigned long)dstStream, (unsigned long)hr);
+            return PUMP_FAILED;
+        }
         *when = ts;
-    } else if (more) {
+    } else if (state == PUMP_MORE) {
         /* A stream tick or a format change with no data; nothing to pass on,
            but the stream has not ended. */
         *when = ts;
     }
-    return more;
+    return state;
 }
 
 BOOL Remux_AddWavAudio(const wchar_t *mp4, const wchar_t *wav)
@@ -342,12 +360,17 @@ BOOL Remux_AddWavAudio(const wchar_t *mp4, const wchar_t *wav)
     /* Feed whichever stream is behind, so the sink never has to hold a whole
        recording of one of them while waiting for the other. */
     while (vMore || aMore) {
-        if (vMore && (!aMore || vTime <= aTime))
-            vMore = PumpOne(vid, SEL_VIDEO,
-                            writer, vStream, &vTime);
-        else if (aMore)
-            aMore = PumpOne(aud, SEL_AUDIO,
-                            writer, aStream, &aTime);
+        PumpState st;
+
+        if (vMore && (!aMore || vTime <= aTime)) {
+            st = PumpOne(vid, SEL_VIDEO, writer, vStream, &vTime);
+            vMore = (st == PUMP_MORE);
+        } else {
+            st = PumpOne(aud, SEL_AUDIO, writer, aStream, &aTime);
+            aMore = (st == PUMP_MORE);
+        }
+        if (st == PUMP_FAILED)
+            goto done;      /* the original mp4 and the wav both stay put */
     }
 
     hr = IMFSinkWriter_Finalize(writer);

@@ -31,6 +31,12 @@ BOOL Overlay_Run(const SnipImage *frozen, const RECT *bounds, SnipMode start,
 
 void Overlay_FreeSelection(SnipSelection *sel);
 
+/* The D3D device and shaders are kept between snips so the overlay comes up
+   without building them each time. Prewarm builds them ahead of the first
+   snip; Shutdown releases them at exit. */
+void Overlay_Prewarm(void);
+void Overlay_Shutdown(void);
+
 /*
  * Cuts 'sel' out of 'frozen' into 'out'. For a freeform selection the pixels
  * outside the outline are left fully transparent, using the same rasteriser

@@ -8,14 +8,14 @@ set "LIBS=user32.lib gdi32.lib shell32.lib advapi32.lib ole32.lib oleaut32.lib u
 set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
 if not exist "%VCVARS%" goto :mingw
 
-rem vcvars64 prints a harmless "vswhere.exe not found" on this box but still
-rem sets the environment; ignore its output.
+rem vcvars64 can print a harmless "vswhere.exe not found" but still sets the
+rem environment; ignore its output.
 call "%VCVARS%" >nul 2>&1
 rc /nologo /fo nitshot.res nitshot.rc || goto :fail
 cl /nologo /TC /std:c17 /O2 /MT /W4 /WX /permissive- /guard:cf /Qspectre /sdl /utf-8 ^
    /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS %SRC% ^
    /link nitshot.res /SUBSYSTEM:WINDOWS /OUT:Nitshot.exe ^
-   %LIBS% /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA /CETCOMPAT || goto :fail
+   %LIBS% /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA /CETCOMPAT /DEPENDENTLOADFLAG:0x800 || goto :fail
 del /q *.obj nitshot.res >nul 2>&1
 echo Built Nitshot.exe with MSVC.
 goto :eof

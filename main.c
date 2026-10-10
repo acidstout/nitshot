@@ -27,6 +27,7 @@
 #include <strsafe.h>
 
 #define WM_TRAYICON     (WM_APP + 1)
+#define WM_APP_PREWARM  (WM_APP + 20)
 #define TIMER_HOOKHEAL  1
 /*
  * A low-level hook can stop working in two ways, neither of which can be
@@ -35,11 +36,11 @@
  * ahead of us and can swallow the keys first. Reinstalling costs two API calls
  * and bounds how long the hotkeys can be silently dead.
  *
- * This is the safety net, not the fix. The failure actually seen here was the
+ * This is the safety net, not the fix. The failure that prompted it was the
  * first kind and was self-inflicted: a 4K HDR snip spent seconds in the
  * encoder on this thread, the hook could not be dispatched while that ran, and
  * Win+Shift+S went to the shell - which opened Snip & Sketch, the one thing
- * this program exists to prevent. Saving moved to a worker thread because of
+ * this program exists to prevent. Saving runs on a worker thread because of
  * it; see Save_SnipAsync.
  */
 #define HOOKHEAL_MS     10000
@@ -194,8 +195,10 @@ static void App_Snip(TriggerSource src)
         return;
 
     /* While a recording runs the hotkey is the way to end it - starting a
-       second capture on top would be the wrong thing to want. */
-    if (Record_IsActive()) {
+       second capture on top would be the wrong thing to want. Busy rather
+       than active, so a press during setup or while the file is being
+       finalised lands here too instead of opening the overlay. */
+    if (Record_IsBusy()) {
         Log_Printf(L"snip: trigger=%d while recording -> stop", (int)src);
         Record_Stop();
         return;
@@ -450,6 +453,18 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             Hotkey_Refresh();
         return 0;
 
+    case WM_APP_PREWARM:
+        Overlay_Prewarm();
+        return 0;
+
+    case WM_DISPLAYCHANGE:
+        /* The warm duplication describes the old desktop. Let it go now and
+           rebuild lazily on the next snip, rather than have that snip find
+           the mismatch and fall back. A recording owns the outputs itself. */
+        if (!Record_IsBusy())
+            Capture_Shutdown();
+        return 0;
+
     case WM_SETTINGCHANGE:
         if (Theme_IsColorSchemeChange(msg, lp))
             Theme_SetDark(Theme_SystemPrefersDark());
@@ -547,15 +562,26 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         MessageBoxW(NULL, warn, APP_TITLE_W, MB_OK | MB_ICONWARNING);
     }
     SetTimer(g_host, TIMER_HOOKHEAL, HOOKHEAL_MS, NULL);
+    /* Posted, so it runs once the tray icon is up and startup is otherwise
+       done: building the overlay's device costs a few hundred milliseconds
+       that would otherwise land on the very first snip. */
+    PostMessageW(g_host, WM_APP_PREWARM, 0, 0);
 
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
 
+    /* A snip saves on a worker thread, and a lossless 4K JPEG XR takes about
+       twenty seconds. Quitting out from under one would leave a truncated
+       file, so the last thing this program does is wait for it. */
+    if (!Save_WaitForPending(40000))
+        Log_Printf(L"exit: an encode did not finish in time");
+
     Settings_Save();     /* the mode the user last picked */
     Capture_Shutdown();
     Save_Shutdown();
+    Overlay_Shutdown();
     CoUninitialize();
     if (mutex)
         CloseHandle(mutex);
