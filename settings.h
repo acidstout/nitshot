@@ -48,6 +48,8 @@ typedef struct {
 
     wchar_t  language[16];      /* "auto", or a tag with a langs\<tag>.ini */
 
+    int      idleReleaseMinutes;/* minutes without a snip before the capture
+                                   machinery is let go entirely; 0 = never */
     BOOL     forceSdr;          /* ignore advanced colour, capture 8-bit  */
     BOOL     debugLog;          /* append diagnostics to Nitshot.log */
     BOOL     forceGdi;          /* skip duplication - diagnostics, and an

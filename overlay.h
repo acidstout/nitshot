@@ -37,6 +37,10 @@ void Overlay_FreeSelection(SnipSelection *sel);
 void Overlay_Prewarm(void);
 void Overlay_Shutdown(void);
 
+/* Lets go of the device the overlay borrowed from capture, so a capture shut
+   down for a long idle stretch actually frees it. */
+void Overlay_Idle(void);
+
 /*
  * Cuts 'sel' out of 'frozen' into 'out'. For a freeform selection the pixels
  * outside the outline are left fully transparent, using the same rasteriser

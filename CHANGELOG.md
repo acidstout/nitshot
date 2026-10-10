@@ -5,6 +5,23 @@ All notable changes to Nitshot. Versions before 0.8.0.0's rename were released a
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+- **Memory no longer piles up while the program waits.** After a snip, the
+  screen-readout buffer (66 MB at 4K HDR) stayed allocated, and the graphics
+  driver kept freed copies of it cached, so every recording, HDR switch or
+  display change added another 64 MB - up to about 180 MB for a program sitting
+  in the tray. The buffer is now released and the driver's cache handed back a
+  few seconds after each snip, and capture rebuilds trim before they release.
+  Idle memory after a snip: 115 MB → 53 MB, with snips exactly as fast as
+  before.
+
+### Added
+- After 5 minutes without a snip, the capture machinery is released entirely,
+  bringing idle memory down to about 17 MB; the next snip takes about 0.1 s
+  longer, once. `IdleReleaseMinutes` in the INI changes the delay (0 = never).
+
 ## [0.8.2.0] - 2026-10-10
 
 ### Changed
@@ -54,7 +71,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [0.8.1.0] - 2026-10-10
 
-### Fixed - Thanks to /u/snaphat on Reddit
+### Fixed
 - Recording kept running on a frozen frame after a display-mode change, a UAC
   prompt or a game switching to exclusive fullscreen, and leaked graphics memory
   each time. The capture is now rebuilt on the same device; a recording whose

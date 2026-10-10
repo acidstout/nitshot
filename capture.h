@@ -58,6 +58,11 @@ BOOL Snip_CropImage(const SnipImage *src, const RECT *rc, SnipImage *dst);
 BOOL Capture_Init(void);
 void Capture_Shutdown(void);
 
+/* Gives back what is only needed during a grab - the staging textures and the
+   driver's cached memory - while keeping the duplication warm. Call it twice a
+   couple of seconds apart; the driver frees asynchronously. */
+void Capture_Idle(void);
+
 /*
  * Grab every monitor into one image laid out like the virtual desktop.
  * 'bounds' (optional) receives the virtual desktop rectangle in screen

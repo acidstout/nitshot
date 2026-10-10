@@ -29,6 +29,8 @@
 #define WM_TRAYICON     (WM_APP + 1)
 #define WM_APP_PREWARM  (WM_APP + 20)
 #define TIMER_HOOKHEAL  1
+#define TIMER_IDLETRIM  2     /* give back the grab's memory after a snip     */
+#define TIMER_DEEPIDLE  3     /* let the capture machinery go after a while   */
 /*
  * A low-level hook can stop working in two ways, neither of which can be
  * detected: Windows drops one whose callback ever failed to answer within
@@ -45,6 +47,17 @@
  */
 #define HOOKHEAL_MS     10000
 
+/*
+ * Memory while waiting. A grab leaves a full desktop of CPU-readable memory
+ * behind - 66 MB at 4K HDR - which the display driver frees only some time
+ * after it is released, so it is given back twice, a couple of seconds apart.
+ * After IdleReleaseMinutes without a snip the whole capture machinery goes too;
+ * the next snip then rebuilds it, which costs about a tenth of a second once.
+ * Measured at 4K HDR: 115 MB idle after a snip before this, 51 MB with the
+ * trim, 17 MB after the long idle.
+ */
+#define IDLETRIM_MS     2000
+
 #define IDM_SNIP        0x100
 #define IDM_FULLSCREEN  0x101
 #define IDM_OPENFOLDER  0x102
@@ -58,6 +71,19 @@ static HICON     g_icon;
 static UINT      g_msgTaskbarCreated;
 static BOOL      g_trayShown;
 static wchar_t   g_lastFile[MAX_PATH];   /* what the last balloon points at */
+static BOOL      g_snipBusy;             /* a snip, its overlay, is under way */
+static int       g_idleTrims;
+
+/* Restarts both idle timers; called whenever capture has just been used. */
+static void App_ArmIdle(void)
+{
+    g_idleTrims = 0;
+    SetTimer(g_host, TIMER_IDLETRIM, IDLETRIM_MS, NULL);
+    if (g_cfg.idleReleaseMinutes > 0)
+        SetTimer(g_host, TIMER_DEEPIDLE, (UINT)g_cfg.idleReleaseMinutes * 60000u, NULL);
+    else
+        KillTimer(g_host, TIMER_DEEPIDLE);
+}
 
 /* ------------------------------------------------------------------ tray */
 
@@ -151,6 +177,7 @@ static void App_Recorded(RecordResult *res)
     /* Warm the still-capture path again now the recorder has let the output go. */
     if (!g_cfg.forceGdi)
         Capture_Init();
+    App_ArmIdle();
     if (!res)
         return;
 
@@ -180,9 +207,22 @@ static void App_Recorded(RecordResult *res)
  * Freeze the desktop, let the user pick a region, then publish the result.
  * PrtScn can be configured to skip the overlay entirely and take everything.
  */
+static void App_SnipOnce(TriggerSource src);
+
+/* Every way out of a snip - taken, cancelled, failed, a recording stopped -
+   ends here, so the idle timers always restart from the last use. */
 static void App_Snip(TriggerSource src)
 {
-    static BOOL   busy;              /* a second hotkey while the overlay is up */
+    if (g_snipBusy)
+        return;                      /* a second hotkey while the overlay is up */
+    g_snipBusy = TRUE;
+    App_SnipOnce(src);
+    g_snipBusy = FALSE;
+    App_ArmIdle();
+}
+
+static void App_SnipOnce(TriggerSource src)
+{
     SnipImage     frozen, shot;
     SnipSelection sel;
     RECT          bounds;
@@ -190,9 +230,6 @@ static void App_Snip(TriggerSource src)
     double        grabMs;
     BOOL          wholeScreen;
     UINT32        w, h;
-
-    if (busy)
-        return;
 
     /* While a recording runs the hotkey is the way to end it - starting a
        second capture on top would be the wrong thing to want. Busy rather
@@ -204,7 +241,6 @@ static void App_Snip(TriggerSource src)
         return;
     }
 
-    busy = TRUE;
     Log_Printf(L"snip: trigger=%d", (int)src);
 
     /* GetTickCount's 15 ms granularity cannot see this at all - the warm
@@ -214,7 +250,6 @@ static void App_Snip(TriggerSource src)
     if (!Capture_VirtualDesktop(&frozen, &bounds)) {
         Log_Printf(L"snip: capture FAILED");
         TrayBalloon(APP_TITLE_W, Lang_Str(STR_MSG_CAPTURE_FAILED));
-        busy = FALSE;
         return;
     }
     QueryPerformanceCounter(&t1);
@@ -237,7 +272,6 @@ static void App_Snip(TriggerSource src)
             Log_Printf(L"snip: cancelled");
             Overlay_FreeSelection(&sel);
             Snip_FreeImage(&frozen);
-            busy = FALSE;
             return;
         }
         if (sel.record) {
@@ -246,7 +280,6 @@ static void App_Snip(TriggerSource src)
             Overlay_FreeSelection(&sel);
             Snip_FreeImage(&frozen);
             App_StartRecording(&screen);
-            busy = FALSE;
             return;
         }
 
@@ -258,7 +291,6 @@ static void App_Snip(TriggerSource src)
         if (!Overlay_ExtractSelection(&frozen, &sel, &shot)) {
             Overlay_FreeSelection(&sel);
             Snip_FreeImage(&frozen);
-            busy = FALSE;
             return;
         }
     }
@@ -285,7 +317,6 @@ static void App_Snip(TriggerSource src)
     if (!Save_SnipAsync(g_host, WM_BSNIP_SAVED, &shot))
         TrayBalloon(APP_TITLE_W, Lang_Str(STR_MSG_SAVE_FAILED));
 
-    busy = FALSE;
 }
 
 /* The worker is finished; 'res' is ours to report and free. */
@@ -449,8 +480,31 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_TIMER:
-        if (wp == TIMER_HOOKHEAL)
+        if (wp == TIMER_HOOKHEAL) {
             Hotkey_Refresh();
+        } else if (wp == TIMER_IDLETRIM) {
+            /* Timers are delivered inside the overlay's own message loop as
+               well, and the overlay draws with the capture device: never
+               touch it mid-snip. The timer stays armed and tries again. */
+            if (g_snipBusy)
+                return 0;
+            if (!Record_IsBusy())
+                Capture_Idle();
+            if (++g_idleTrims >= 2)
+                KillTimer(hwnd, TIMER_IDLETRIM);
+        } else if (wp == TIMER_DEEPIDLE) {
+            if (g_snipBusy)
+                return 0;
+            KillTimer(hwnd, TIMER_DEEPIDLE);
+            if (!Record_IsBusy()) {
+                /* The overlay holds a reference to the capture device; both
+                   have to let go for the device to be freed. */
+                Overlay_Idle();
+                Capture_Shutdown();
+                Log_Printf(L"idle: %d min without a snip, capture released",
+                           g_cfg.idleReleaseMinutes);
+            }
+        }
         return 0;
 
     case WM_APP_PREWARM:
@@ -474,6 +528,8 @@ static LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         Record_Stop();
         RecordBar_Hide();
         KillTimer(hwnd, TIMER_HOOKHEAL);
+        KillTimer(hwnd, TIMER_IDLETRIM);
+        KillTimer(hwnd, TIMER_DEEPIDLE);
         Hotkey_Uninstall();
         TrayRemove();
         PostQuitMessage(0);
@@ -562,6 +618,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
         MessageBoxW(NULL, warn, APP_TITLE_W, MB_OK | MB_ICONWARNING);
     }
     SetTimer(g_host, TIMER_HOOKHEAL, HOOKHEAL_MS, NULL);
+    App_ArmIdle();
     /* Posted, so it runs once the tray icon is up and startup is otherwise
        done: building the overlay's device costs a few hundred milliseconds
        that would otherwise land on the very first snip. */

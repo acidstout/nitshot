@@ -15,7 +15,7 @@ settings over from the old INI section and re-registers autostart under the new 
 Snips already saved in `Pictures\BetterSnippingTool` stay where they are; new ones go
 to `Pictures\Nitshot`.
 
-**User guide:** [English](docs/UserGuide.en.md) · [Deutsch](docs/Benutzerhandbuch.de.md). This README is the technical reference.
+**User guide:** [English](docs/UserGuide.en.md) · [Deutsch](docs/Benutzerhandbuch.de.md). This README is the technical reference; what changed in each version is in the [changelog](CHANGELOG.md).
 
 ## What it does
 
@@ -124,6 +124,32 @@ half-black desktop would be worse than a slower correct one.
   duplication is unavailable, and for **rotated** outputs — duplication hands
   those out in the panel's native orientation, and GDI simply reads them the
   right way round. `ForceGdi=1` in the INI pins this path for testing.
+
+**Memory while waiting.** A grab needs a full desktop of CPU-readable staging
+memory - 66 MB at 4K HDR - and the display driver does not hand freed textures
+back to the system by itself: it keeps them in a cache of its own, even past the
+release of the device that made them. Measured at 4K HDR, the waiting program
+held 115 MB after its first snip, and every capture rebuild (a recording, an HDR
+switch, a display change) added another 64 MB until it levelled off around
+180 MB. Not a leak - repeated snips stayed flat - but memory nobody was using.
+
+- Two seconds after a snip, the staging texture is released and the device is
+  trimmed with `IDXGIDevice3::Trim`, the call Windows provides for an app going
+  quiet; two seconds later it is trimmed once more, because the driver frees
+  asynchronously and the first trim finds the texture still alive. The
+  duplication stays warm, so the next grab is exactly as fast (~21 ms).
+- A capture rebuild trims before it releases, so rebuilds no longer accumulate.
+- After `IdleReleaseMinutes` (default 5) without a snip, the capture machinery
+  and the overlay's borrowed device are let go entirely; the next snip rebuilds
+  them, which costs about a tenth of a second once.
+
+| | idle memory, 4K HDR |
+|---|---|
+| warm, after a snip, before | 115 MB, growing to ~180 MB with rebuilds |
+| warm, after a snip, now | 53 MB - the same as before the first snip |
+| after the long idle | 17 MB |
+
+Measured on an HDR display; an SDR display needs a quarter of the staging memory.
 
 ## HDR
 
@@ -562,6 +588,7 @@ defaults on first run.
 | `HdrSdrRollOff` | 0 | keep highlight detail in the 8-bit copy, at the cost of white landing near 231 |
 | `HdrJxrQuality` | 90 | 1–100; 100 is true lossless and much slower |
 | `ForceSdr` | 0 | ignore advanced colour and capture 8-bit |
+| `IdleReleaseMinutes` | 5 | minutes without a snip before the capture machinery is released entirely (0 = keep it warm); the next snip then takes about 0.1 s longer, once |
 | `RecordAudio` | 1 | 0 none, 1 system sound, 2 microphone |
 | `RecordFps` | 30 | 5–60 |
 | `RecordRawAudio` | 1 | ask the endpoint to bypass its effects; many drivers refuse |

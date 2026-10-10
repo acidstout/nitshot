@@ -13,6 +13,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <dxgi1_5.h>
+#include <dxgi1_3.h>      /* IDXGIDevice3::Trim */
 
 /* How long a grab may spend coaxing a frame out of one output before the
    whole capture gives up and goes to GDI. A static desktop produces no new
@@ -130,6 +131,59 @@ BOOL Snip_CropImage(const SnipImage *src, const RECT *rc, SnipImage *dst)
 
 /* --------------------------------------------------------- duplication */
 
+/*
+ * Hands the driver's spare memory for this device back to the system.
+ *
+ * Releasing a texture does not return its memory: the display driver keeps
+ * freed allocations - above all the large CPU-readable staging textures - in a
+ * cache of its own for reuse, even past the device's own release. Measured at
+ * 4K HDR that was 64 MB per capture rebuild, levelling off at about 130 MB that
+ * a program sitting idle in the tray had no use for. Trim is the call Windows
+ * provides for exactly this, for an app that is about to go quiet; it needs the
+ * context's state cleared first, or the bound resources stay pinned.
+ */
+static void TrimDevice(CapOutput *o)
+{
+    IDXGIDevice3 *d3 = NULL;
+
+    if (!o->dev)
+        return;
+    if (o->ctx) {
+        D3D11_QUERY_DESC qd;
+        ID3D11Query     *done = NULL;
+
+        ID3D11DeviceContext_ClearState(o->ctx);
+        /*
+         * A released texture is only really destroyed once the GPU has
+         * finished the work that used it, and Trim gives back only what is
+         * already gone - trimming straight after a grab found the staging
+         * texture still alive and returned nothing. Wait (briefly, bounded)
+         * for the GPU to drain first.
+         */
+        qd.Query     = D3D11_QUERY_EVENT;
+        qd.MiscFlags = 0;
+        if (SUCCEEDED(ID3D11Device_CreateQuery(o->dev, &qd, &done))) {
+            BOOL finished = FALSE;
+            int  waited;
+            ID3D11DeviceContext_End(o->ctx, (ID3D11Asynchronous *)done);
+            ID3D11DeviceContext_Flush(o->ctx);
+            for (waited = 0; waited < 200; waited++) {
+                if (ID3D11DeviceContext_GetData(o->ctx, (ID3D11Asynchronous *)done,
+                                                &finished, sizeof(finished), 0) == S_OK &&
+                    finished)
+                    break;
+                Sleep(1);
+            }
+            ID3D11Query_Release(done);
+        }
+        ID3D11DeviceContext_Flush(o->ctx);
+    }
+    if (SUCCEEDED(ID3D11Device_QueryInterface(o->dev, &IID_IDXGIDevice3, (void **)&d3))) {
+        IDXGIDevice3_Trim(d3);
+        IDXGIDevice3_Release(d3);
+    }
+}
+
 static void ReleaseOutput(CapOutput *o)
 {
     if (o->holding && o->dup) {
@@ -138,6 +192,7 @@ static void ReleaseOutput(CapOutput *o)
     }
     if (o->staging) { ID3D11Texture2D_Release(o->staging);        o->staging = NULL; }
     if (o->dup)     { IDXGIOutputDuplication_Release(o->dup);     o->dup     = NULL; }
+    TrimDevice(o);
     if (o->out5)    { IDXGIOutput5_Release(o->out5);              o->out5    = NULL; }
     if (o->out1)    { IDXGIOutput1_Release(o->out1);              o->out1    = NULL; }
     if (o->ctx)     { ID3D11DeviceContext_Release(o->ctx);        o->ctx     = NULL; }
@@ -463,6 +518,30 @@ BOOL Capture_Init(void)
     Log_Printf(L"capture: %d output(s), hdr=%d, sdr white %.0f nits",
                g_outCount, (int)g_hdrMode, g_sdrWhiteNits);
     return g_outCount > 0;
+}
+
+/*
+ * Called a little while after a snip. The staging texture is the largest thing
+ * capture holds - a full desktop of CPU-readable memory, 66 MB at 4K HDR - and
+ * it is only needed during a grab. The device and the duplication stay warm,
+ * so the next grab is as fast as before (measured: 21 ms either way).
+ *
+ * Call it twice, a couple of seconds apart: the driver frees a released
+ * texture asynchronously, and a trim straight after the release finds it still
+ * alive. Measured at 4K HDR: idle 115 MB after a snip without this, 51 MB with.
+ */
+void Capture_Idle(void)
+{
+    int i;
+    for (i = 0; i < g_outCount; i++) {
+        CapOutput *o = &g_out[i];
+        if (o->staging) {
+            ID3D11Texture2D_Release(o->staging);
+            o->staging = NULL;
+            o->stgW = o->stgH = 0;
+        }
+        TrimDevice(o);
+    }
 }
 
 void Capture_Shutdown(void)

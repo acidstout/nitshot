@@ -558,6 +558,14 @@ void Overlay_Prewarm(void)
         CloseHandle((HANDLE)th);
 }
 
+void Overlay_Idle(void)
+{
+    /* The pipeline holds a reference to the capture device; without letting
+       go of it here, shutting capture down while idle would free nothing. The
+       bytecode stays, so the next snip rebuilds this in about a millisecond. */
+    ReleaseShared();
+}
+
 void Overlay_Shutdown(void)
 {
     int i;

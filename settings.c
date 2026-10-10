@@ -177,6 +177,10 @@ void Settings_Load(void)
     g_cfg.settingsX = GetSignedInt(L"SettingsX", SETTINGS_POS_UNSET);
     g_cfg.settingsY = GetSignedInt(L"SettingsY", SETTINGS_POS_UNSET);
 
+    g_cfg.idleReleaseMinutes = GetPrivateProfileIntW(SEC, L"IdleReleaseMinutes", 5, ini);
+    if (g_cfg.idleReleaseMinutes < 0)    g_cfg.idleReleaseMinutes = 0;
+    if (g_cfg.idleReleaseMinutes > 1440) g_cfg.idleReleaseMinutes = 1440;
+
     g_cfg.forceSdr      = GetBool(L"ForceSdr",      FALSE);
     g_cfg.debugLog      = GetBool(L"DebugLog",      FALSE);
 }
@@ -213,6 +217,7 @@ void Settings_Save(void)
                                Settings_IniPath());
     PutInt (L"SettingsX", g_cfg.settingsX);
     PutInt (L"SettingsY", g_cfg.settingsY);
+    PutInt (L"IdleReleaseMinutes", g_cfg.idleReleaseMinutes);
     PutBool(L"ForceSdr",     g_cfg.forceSdr);
     PutBool(L"DebugLog",     g_cfg.debugLog);
 }
